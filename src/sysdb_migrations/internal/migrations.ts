@@ -1133,5 +1133,9 @@ $$ LANGUAGE plpgsql;`,
         `DROP INDEX ${isCockroach ? '' : 'CONCURRENTLY'} IF EXISTS "${schemaName}"."idx_operation_outputs_completed_at_function_name"`,
       ],
     },
+    {
+      name: '121_queue_pause',
+      pg: [`ALTER TABLE "${schemaName}".queues ADD COLUMN paused BOOLEAN NOT NULL DEFAULT false`],
+    },
   ];
 }

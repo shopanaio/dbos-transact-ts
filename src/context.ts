@@ -28,6 +28,7 @@ export interface DBOSContextOptions {
 
 export interface DBOSLocalCtx extends DBOSContextOptions {
   workflowId?: string;
+  workflowQueueName?: string;
   curWFFunctionId?: number; // If currently in a WF, the current call number / ID
   activeStreamReads?: number; // Checkpointed stream reads that have reserved a step but not yet recorded it
   deadlineEpochMS?: number;

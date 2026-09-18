@@ -282,6 +282,12 @@ describe('dbos-config', () => {
         systemDatabaseUrl:
           'postgresql://postgres:dbos@localhost:5432/dbostest_dbos_sys?connect_timeout=10&sslmode=disable',
         sysDbPoolSize: undefined,
+        maxConcurrentQueueDispatches: undefined,
+        notificationCoalesceMs: undefined,
+        observabilityQueryTimeoutMs: undefined,
+        systemDatabasePollingConcurrency: undefined,
+        queuePollingBatchSize: 1000,
+        queuePollingCoalesceMs: 50,
         systemDatabasePool: undefined,
         systemDatabaseSchemaName: 'dbos',
         schedulerPollingIntervalMs: undefined,
@@ -291,6 +297,7 @@ describe('dbos-config', () => {
         telemetry: {
           logs: {
             logLevel: 'info',
+            logger: undefined,
             addContextMetadata: undefined,
           },
           OTLPExporter: {
@@ -367,6 +374,12 @@ describe('dbos-config', () => {
         systemDatabaseUrl:
           'postgres://jon:doe@mother:2345/dbostest?sslmode=require&sslrootcert=my_cert&connect_timeout=7',
         sysDbPoolSize: undefined,
+        maxConcurrentQueueDispatches: undefined,
+        notificationCoalesceMs: undefined,
+        observabilityQueryTimeoutMs: undefined,
+        systemDatabasePollingConcurrency: undefined,
+        queuePollingBatchSize: 1000,
+        queuePollingCoalesceMs: 50,
         systemDatabasePool: undefined,
         systemDatabaseSchemaName: 'dbos',
         schedulerPollingIntervalMs: undefined,
@@ -376,6 +389,7 @@ describe('dbos-config', () => {
         telemetry: {
           logs: {
             logLevel: 'info',
+            logger: undefined,
             addContextMetadata: undefined,
           },
           OTLPExporter: {
@@ -395,6 +409,12 @@ describe('dbos-config', () => {
         name: undefined,
         systemDatabaseUrl: 'postgres://foo:bar@father:1234/blahblahblah',
         sysDbPoolSize: undefined,
+        maxConcurrentQueueDispatches: undefined,
+        notificationCoalesceMs: undefined,
+        observabilityQueryTimeoutMs: undefined,
+        systemDatabasePollingConcurrency: undefined,
+        queuePollingBatchSize: 1000,
+        queuePollingCoalesceMs: 50,
         systemDatabasePool: undefined,
         systemDatabaseSchemaName: 'dbos',
         schedulerPollingIntervalMs: undefined,
@@ -404,6 +424,7 @@ describe('dbos-config', () => {
         telemetry: {
           logs: {
             logLevel: 'info',
+            logger: undefined,
             addContextMetadata: undefined,
           },
           OTLPExporter: {
@@ -511,5 +532,23 @@ describe('dbos-config', () => {
       await expect(DBOS.launch()).rejects.toThrow('No application name was provided');
       expect(DBOS.isInitialized()).toBe(false);
     });
+  });
+});
+
+describe('batch polling configuration (SC-qp06)', () => {
+  test('defaults and explicit overrides survive translation', () => {
+    expect(translateDbosConfig({ name: 'test' })).toMatchObject({
+      queuePollingBatchSize: 1000,
+      queuePollingCoalesceMs: 50,
+    });
+    expect(translateDbosConfig({ name: 'test', queuePollingBatchSize: 7, queuePollingCoalesceMs: 1 })).toMatchObject({
+      queuePollingBatchSize: 7,
+      queuePollingCoalesceMs: 1,
+    });
+  });
+  test.each(['queuePollingBatchSize', 'queuePollingCoalesceMs'] as const)('rejects invalid %s', (key) => {
+    for (const value of [0, -1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => translateDbosConfig({ [key]: value })).toThrow(key);
+    }
   });
 });

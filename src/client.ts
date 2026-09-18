@@ -160,6 +160,8 @@ export class DBOSClient {
       applicationName,
       observabilityQueryTimeoutMs,
     );
+    // Control writes notify executors even though this client has no listener.
+    this.systemDatabase.queueControlNotificationsEnabled = true;
   }
 
   /**
@@ -448,13 +450,17 @@ export class DBOSClient {
     return queue;
   }
 
+  async pauseQueue(name: string) { return this.systemDatabase.setQueuePaused(name, true); }
+  async wakeQueue(name: string) { return this.systemDatabase.setQueuePaused(name, false); }
+  async getQueueControlState(name: string) { return this.systemDatabase.getQueueControlState(name); }
+
   /** Retrieve a database-backed queue by name, or `null` if no row exists. */
   async retrieveQueue(name: string): Promise<WorkflowQueue | null> {
     const record = await this.systemDatabase.getQueue(name);
     return record === null ? null : new WorkflowQueue(record, true, this.systemDatabase);
   }
 
-  /** Delete a database-backed queue. Pending workflows on it are unrecoverable. */
+  /** Delete the queue identity and pause state, retaining workflows. Recreating the name may execute its backlog. */
   async deleteQueue(name: string): Promise<void> {
     await this.systemDatabase.deleteQueue(name);
   }

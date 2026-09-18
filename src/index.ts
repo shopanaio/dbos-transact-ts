@@ -53,3 +53,5 @@ export { DBOSSpan } from './telemetry/traces';
 export { VersionInfo, ApplicationRowCounts } from './system_database';
 
 export { EnqueueWorkflowOptions } from './enqueue_options';
+
+export { QueueControlError, type QueueControlState } from './system_database';

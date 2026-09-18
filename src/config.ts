@@ -144,6 +144,12 @@ export function getDbosConfig(
 }
 
 export function translateDbosConfig(options: Partial<DBOSConfig>): DBOSConfigInternal {
+  for (const key of ['queuePollingBatchSize', 'queuePollingCoalesceMs'] as const) {
+    const value = options[key];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
+      throw new Error(`${key} must be a positive finite integer`);
+    }
+  }
   if (
     options.maxConcurrentQueueDispatches !== undefined &&
     (!Number.isInteger(options.maxConcurrentQueueDispatches) || options.maxConcurrentQueueDispatches <= 0)
@@ -185,6 +191,8 @@ export function translateDbosConfig(options: Partial<DBOSConfig>): DBOSConfigInt
     },
     schedulerPollingIntervalMs: options.schedulerPollingIntervalMs,
     maxConcurrentQueueDispatches: options.maxConcurrentQueueDispatches,
+    queuePollingBatchSize: options.queuePollingBatchSize ?? 1000,
+    queuePollingCoalesceMs: options.queuePollingCoalesceMs ?? 50,
     useListenNotify: options.useListenNotify ?? true,
     notificationCoalesceMs: options.notificationCoalesceMs,
     observabilityQueryTimeoutMs: options.observabilityQueryTimeoutMs,

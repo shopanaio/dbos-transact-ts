@@ -689,11 +689,13 @@ describe('queued-wf-tests-simple', () => {
     });
 
     await DBOS.resumeWorkflow(wfid);
-
-    await expect(regularHandle.getResult()).resolves.toBeUndefined();
-
-    // Complete the blocked workflow. Verify the second regular workflow also completes.
+    // SC-qp10: resume retains the queue and cannot bypass its occupied concurrency slot.
+    await expect(regularHandle.getStatus()).resolves.toMatchObject({
+      status: StatusString.ENQUEUED,
+      queueName: TestResumeQueues.queue.name,
+    });
     TestResumeQueues.blockingEvent.set();
+    await expect(regularHandle.getResult()).resolves.toBeUndefined();
     await expect(blockedHandle.getResult()).resolves.toBeUndefined();
     await expect(regularHandleTwo.getResult()).resolves.toBeUndefined();
 
@@ -753,12 +755,14 @@ describe('queued-wf-tests-simple', () => {
     });
 
     await DBOS.resumeWorkflow(wfid);
-    console.log('RESUMED', wfid);
-
-    await expect(regularHandle.getResult()).resolves.toBeUndefined();
-
-    // Complete the blocked workflow. Verify the second regular workflow also completes.
+    // SC-qp10: the resumed workflow keeps both its queue and occupied partition.
+    await expect(regularHandle.getStatus()).resolves.toMatchObject({
+      status: StatusString.ENQUEUED,
+      queueName: TestResumeQueuesPartitioned.queue.name,
+      queuePartitionKey: key,
+    });
     TestResumeQueuesPartitioned.blockingEvent.set();
+    await expect(regularHandle.getResult()).resolves.toBeUndefined();
     await expect(blockedHandle.getResult()).resolves.toBeUndefined();
     await expect(regularHandleTwo.getResult()).resolves.toBeUndefined();
 
@@ -1689,7 +1693,12 @@ describe('queue-time-outs', () => {
       workflowID,
       queueName: timeoutQueue.name,
     }).timeoutParentStartWF(100);
-    await expect(handle.getResult()).rejects.toThrow(new DBOSAwaitedWorkflowCancelledError(childID));
+    // The parent's recorded error crosses serialization; assert its public fields, not its prototype.
+    await expect(handle.getResult()).rejects.toMatchObject({
+      message: `Awaited ${childID} was cancelled`,
+      workflowID: childID,
+      dbosErrorCode: getDBOSErrorCode(new DBOSAwaitedWorkflowCancelledError(childID)),
+    });
     await expect(handle.getStatus()).resolves.toMatchObject({
       status: StatusString.ERROR,
     });
@@ -1736,7 +1745,12 @@ describe('queue-time-outs', () => {
       timeoutMS: 4000,
     }).timeoutParentEnqueueWF(100);
     await events_map.get(childID)?.wait();
-    await expect(handle.getResult()).rejects.toThrow(new DBOSAwaitedWorkflowCancelledError(childID));
+    // The parent's recorded error crosses serialization; assert its public fields, not its prototype.
+    await expect(handle.getResult()).rejects.toMatchObject({
+      message: `Awaited ${childID} was cancelled`,
+      workflowID: childID,
+      dbosErrorCode: getDBOSErrorCode(new DBOSAwaitedWorkflowCancelledError(childID)),
+    });
     await expect(handle.getStatus()).resolves.toMatchObject({
       status: StatusString.ERROR,
     });
@@ -3016,6 +3030,9 @@ describe('bounded-lane dispatcher', () => {
       logger: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
       dispatchDequeuedWorkflows: () => Promise.resolve(),
       systemDatabase: {
+        queueControlListeners: new Set(),
+        queueBudgetListeners: new Set(),
+        findQueuesWithEnqueuedWorkflows: async (requests: { name: string }[]) => requests,
         // The dispatcher discovers this test's queues through the queues table.
         listQueues: () => Promise.resolve(laneRecords),
         getQueuePartitions: () => Promise.resolve([]),

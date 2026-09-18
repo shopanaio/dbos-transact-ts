@@ -170,7 +170,30 @@ export const DEFAULT_RENAME_BATCH_SIZE = 10_000;
 // Rows deleted per transaction by garbage collection.
 export const DEFAULT_GC_BATCH_SIZE = 50_000;
 
-export interface QueueRecord {
+export interface QueueControlState {
+  queueId: string;
+  name: string;
+  paused: boolean;
+}
+
+export class QueueControlError extends Error {
+  constructor(public readonly code: 'QUEUE_NOT_FOUND' | 'INTERNAL_QUEUE' | 'QUEUE_OWNER_MISMATCH', name: string) {
+    super(`${code}: ${name}`);
+    this.name = 'QueueControlError';
+  }
+}
+
+/** A guard rejection is not dequeue contention. */
+export class QueueUnavailableError extends Error {}
+
+export interface QueueReadinessRequest {
+  name: string;
+  queueId: string;
+  generation: number;
+  internal: boolean;
+}
+
+export interface QueueRecord extends QueueControlState {
   name: string;
   concurrency: number | null;
   workerConcurrency: number | null;
@@ -189,7 +212,7 @@ export interface QueueRecord {
 }
 
 /** The subset of a queue record that may be changed after creation. Ownership moves only by rename. */
-export type QueueRecordUpdate = Partial<Omit<QueueRecord, 'name' | 'applicationName'>>;
+export type QueueRecordUpdate = Partial<Omit<QueueRecord, 'name' | 'applicationName' | 'queueId' | 'paused'>>;
 
 const QUEUE_COLUMN_BY_FIELD: Record<keyof QueueRecordUpdate, string> = {
   concurrency: 'concurrency',
@@ -205,12 +228,14 @@ const QUEUE_COLUMN_BY_FIELD: Record<keyof QueueRecordUpdate, string> = {
 };
 
 const QUEUE_COLUMNS =
-  'name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, ' +
+  'queue_id, paused, name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, ' +
   'partition_concurrency, partition_worker_concurrency, partition_rate_limit_max, partition_rate_limit_period_sec, ' +
   'polling_interval_sec, application_name';
 
 function queueRecordFromRow(row: queues): QueueRecord {
   return {
+    queueId: row.queue_id,
+    paused: row.paused,
     name: row.name,
     concurrency: row.concurrency,
     workerConcurrency: row.worker_concurrency,
@@ -925,6 +950,7 @@ export class SystemDatabase {
   dbPollingIntervalEventMs: number = 10000;
   dbPollingIntervalStreamMs: number = 1000;
   shouldUseDBNotifications: boolean = true;
+  queueControlNotificationsEnabled: boolean = true;
   readonly notificationsMap: NotificationMap<void> = new NotificationMap();
   readonly workflowEventsMap: NotificationMap<void> = new NotificationMap();
   readonly streamsMap: NotificationMap<void> = new NotificationMap();
@@ -983,6 +1009,7 @@ export class SystemDatabase {
   ) {
     this.schemaName = schemaName;
     this.shouldUseDBNotifications = useListenNotify;
+    this.queueControlNotificationsEnabled = useListenNotify;
     this.notificationCoalesceMs = notificationCoalesceMs;
     validateObservabilityQueryTimeoutMs(observabilityQueryTimeoutMs);
     // Floor at 1ms: PostgreSQL reads 0 as "no timeout", the loosest cap rather than the tightest.
@@ -1303,7 +1330,6 @@ export class SystemDatabase {
        SET status = $1,
            deduplication_id = NULL,
            started_at_epoch_ms = NULL,
-           queue_name = NULL,
            updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
            completed_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint
        WHERE workflow_uuid = ANY($2::text[]) AND status = $3 AND recovery_attempts >= $4`,
@@ -1869,7 +1895,7 @@ export class SystemDatabase {
   async #cancelWorkflows(workflowIDs: string[]): Promise<void> {
     await this.pool.query(
       `UPDATE "${this.schemaName}".workflow_status
-       SET status = $1, queue_name = NULL, deduplication_id = NULL, started_at_epoch_ms = NULL,
+       SET status = $1, deduplication_id = NULL, started_at_epoch_ms = NULL,
            updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
            completed_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint
        WHERE workflow_uuid = ANY($2)
@@ -1886,14 +1912,14 @@ export class SystemDatabase {
   async resumeWorkflows(workflowIDs: string[], queueName?: string): Promise<void> {
     await this.pool.query(
       `UPDATE "${this.schemaName}".workflow_status
-       SET status = $1, queue_name = $2, recovery_attempts = 0,
+       SET status = $1, queue_name = COALESCE($2, queue_name, $6), recovery_attempts = 0,
            workflow_deadline_epoch_ms = NULL, deduplication_id = NULL,
            started_at_epoch_ms = NULL,
            updated_at = (EXTRACT(EPOCH FROM now()) * 1000)::bigint,
            completed_at = NULL
        WHERE workflow_uuid = ANY($3)
          AND status NOT IN ($4, $5)`,
-      [StatusString.ENQUEUED, queueName ?? INTERNAL_QUEUE_NAME, workflowIDs, StatusString.SUCCESS, StatusString.ERROR],
+      [StatusString.ENQUEUED, queueName ?? null, workflowIDs, StatusString.SUCCESS, StatusString.ERROR, INTERNAL_QUEUE_NAME],
     );
   }
 
@@ -2080,7 +2106,7 @@ export class SystemDatabase {
     }
 
     for (const wfid of allIds) {
-      this.runningWorkflowMap.delete(wfid);
+      this.clearRunningWorkflow(wfid);
     }
   }
 
@@ -2662,7 +2688,9 @@ export class SystemDatabase {
   }
 
   clearRunningWorkflow(workflowID: string): void {
+    const queueName = this.runningWorkflowMap.get(workflowID)?.queueName;
     this.runningWorkflowMap.delete(workflowID);
+    if (queueName) for (const listener of this.queueBudgetListeners) listener(queueName);
   }
 
   /** Workflows this worker is running for a queue, across every partition of it. */
@@ -3562,6 +3590,7 @@ export class SystemDatabase {
   }
 
   // ==================== Queues ====================
+
   async transitionDelayedWorkflows(): Promise<void> {
     // Transition workflows from DELAYED to ENQUEUED when their delay has expired.
     // For debounced workflows, clear the deduplication ID in the same atomic update: it is a
@@ -3646,6 +3675,8 @@ export class SystemDatabase {
       } else {
         await client.query('BEGIN');
       }
+
+      await this.guardQueueClaim(client, queue);
 
       /** Slots left in a rate limit's rolling window, at the scope that limit applies to. */
       const rateLimitRemaining = async (rateLimit: QueueRateLimit, partitionScoped: boolean): Promise<number> => {
@@ -3846,6 +3877,7 @@ export class SystemDatabase {
     const client = await this.#connect();
     try {
       await client.query('BEGIN');
+      await this.guardQueueClaim(client, queue);
 
       const latestVersion = await this.#latestApplicationVersionName(client);
       const isLatestVersion = latestVersion === undefined || latestVersion === appVersion;
@@ -5302,6 +5334,86 @@ export class SystemDatabase {
 
   // ==================== Queues ====================
 
+  readonly queueControlListeners = new Set<(name?: string) => void>();
+  readonly queueBudgetListeners = new Set<(name: string) => void>();
+
+  private validateControlRow(name: string, row?: queues): asserts row is queues {
+    if (name.startsWith('_dbos_')) throw new QueueControlError('INTERNAL_QUEUE', name);
+    if (!row) throw new QueueControlError('QUEUE_NOT_FOUND', name);
+    if (row.application_name !== null && row.application_name !== this.appName) {
+      throw new QueueControlError('QUEUE_OWNER_MISMATCH', name);
+    }
+  }
+
+  async getQueueControlState(name: string): Promise<QueueControlState> {
+    const { rows } = await this.pool.query<queues>(
+      `SELECT ${QUEUE_COLUMNS} FROM "${this.schemaName}".queues WHERE name = $1`, [name]);
+    this.validateControlRow(name, rows[0]);
+    return { name, queueId: rows[0].queue_id, paused: rows[0].paused };
+  }
+
+  async setQueuePaused(name: string, paused: boolean): Promise<QueueControlState> {
+    if (name.startsWith('_dbos_')) throw new QueueControlError('INTERNAL_QUEUE', name);
+    const client = await this.#connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query<queues>(
+        `SELECT ${QUEUE_COLUMNS} FROM "${this.schemaName}".queues WHERE name = $1 FOR UPDATE`, [name]);
+      this.validateControlRow(name, rows[0]);
+      const row = rows[0];
+      if (row.paused !== paused) {
+        await client.query(`UPDATE "${this.schemaName}".queues SET paused = $2 WHERE queue_id = $1 RETURNING paused`, [row.queue_id, paused]);
+        if (this.queueControlNotificationsEnabled && !(await isCockroachDB(client))) {
+          let payload = JSON.stringify({ schema: this.schemaName, queueId: row.queue_id, name });
+          if (Buffer.byteLength(payload) > 7000) payload = JSON.stringify({ schema: this.schemaName, queueId: row.queue_id });
+          await client.query('SELECT pg_notify($1, $2)', ['dbos_queue_control_channel', payload]);
+        }
+      }
+      await client.query('COMMIT');
+      if (row.paused !== paused) for (const listener of this.queueControlListeners) listener(name);
+      return { name, queueId: row.queue_id, paused };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally { client.release(); }
+  }
+
+  private async guardQueueClaim(client: PoolClient, queue: WorkflowQueue): Promise<void> {
+    if (!queue.databaseBacked) return;
+    const params: unknown[] = [queue.name, queue.queueId];
+    const scope = this.#appNameFilter('application_name', this.appName, params);
+    const { rows } = await client.query<{ paused: boolean }>(
+      `SELECT paused FROM "${this.schemaName}".queues WHERE name = $1 AND queue_id = $2 AND ${scope} FOR SHARE`, params);
+    if (!rows[0] || rows[0].paused) throw new QueueUnavailableError(queue.name);
+  }
+
+  async findQueuesWithEnqueuedWorkflows(requests: QueueReadinessRequest[], appVersion: string): Promise<QueueReadinessRequest[]> {
+    if (!requests.length) return [];
+    const params: unknown[] = [requests.map(r => r.name), requests.map(r => r.queueId), requests.map(r => r.generation), requests.map(r => r.internal), appVersion];
+    const versions = this.#appNameFilter('application_name', this.appName, params);
+    const workflows = this.#appNameFilter('w.application_name', this.appName, params);
+    const queuesScope = this.#appNameFilter('q.application_name', this.appName, params);
+    const { rows } = await this.pool.query<QueueReadinessRequest>(`
+      WITH latest AS MATERIALIZED (
+        SELECT version_name FROM "${this.schemaName}".application_versions
+        WHERE ${versions} ORDER BY version_timestamp DESC LIMIT 1
+      )
+      SELECT r.name, r.queue_id AS "queueId", r.generation, r.internal
+      FROM unnest($1::text[], $2::text[], $3::integer[], $4::boolean[]) AS r(name, queue_id, generation, internal)
+      WHERE (r.internal OR EXISTS (
+        SELECT 1 FROM "${this.schemaName}".queues q
+        WHERE q.name = r.name AND q.queue_id::text = r.queue_id AND NOT q.paused AND ${queuesScope}
+      )) AND EXISTS (
+        SELECT 1 FROM "${this.schemaName}".workflow_status w
+        WHERE w.queue_name = r.name AND w.status = 'ENQUEUED' AND ${workflows}
+          AND (w.application_version = $5 OR (w.application_version IS NULL
+            AND ((SELECT version_name FROM latest) IS NULL OR (SELECT version_name FROM latest) = $5)))
+        LIMIT 1
+      )`, params);
+    return rows;
+  }
+
+
   async getQueue(name: string): Promise<QueueRecord | null> {
     const { rows } = await this.pool.query<queues>(
       `SELECT ${QUEUE_COLUMNS}
@@ -5316,13 +5428,14 @@ export class SystemDatabase {
    * List only queues owned by these applications, plus unclaimed ones.
    * By default, only list this application's queues.
    */
-  async listQueues(applicationName?: string | string[]): Promise<QueueRecord[]> {
+  async listQueues(applicationName?: string | string[], names?: string[]): Promise<QueueRecord[]> {
     const params: unknown[] = [];
     const scope = this.#observabilityFilter('application_name', applicationName, params);
+    const nameFilter = names ? ` AND name = ANY($${params.push(names)}::text[])` : '';
     const { rows } = await this.pool.query<queues>(
       `SELECT ${QUEUE_COLUMNS}
          FROM "${this.schemaName}".queues
-        WHERE ${scope}`,
+        WHERE ${scope}${nameFilter}`,
       params,
     );
     return rows.map(queueRecordFromRow);
@@ -6035,6 +6148,7 @@ export class SystemDatabase {
         await client.query(`LISTEN ${DBOS_NOTIFICATIONS_CHANNEL};`);
         await client.query(`LISTEN ${DBOS_WORKFLOW_EVENTS_CHANNEL};`);
         await client.query(`LISTEN ${DBOS_STREAMS_CHANNEL};`);
+        await client.query(`LISTEN dbos_queue_control_channel;`);
 
         // The self-test's NOTIFY needs a second client, which can queue forever on an ending pool.
         if (this.#abandonIfStopped(client)) return;
@@ -6072,7 +6186,12 @@ export class SystemDatabase {
 
         const handler = (msg: Notification) => {
           if (!this.shouldUseDBNotifications) return;
-          if (msg.channel === DBOS_NOTIFICATIONS_CHANNEL && msg.payload) {
+          if (msg.channel === 'dbos_queue_control_channel' && msg.payload) {
+            try {
+              const hint = JSON.parse(msg.payload) as { schema?: string; name?: string };
+              if (hint.schema === this.schemaName) for (const listener of this.queueControlListeners) listener(hint.name);
+            } catch { /* Invalid hints never change persisted state. */ }
+          } else if (msg.channel === DBOS_NOTIFICATIONS_CHANNEL && msg.payload) {
             this.notificationsMap.callCallbacks(msg.payload);
           } else if (msg.channel === DBOS_WORKFLOW_EVENTS_CHANNEL && msg.payload) {
             this.workflowEventsMap.callCallbacks(msg.payload);

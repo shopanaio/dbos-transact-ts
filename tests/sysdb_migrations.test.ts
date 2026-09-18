@@ -93,6 +93,14 @@ describe('sysdb migration runner', () => {
     expect(second.toVersion).toBe(migrations.length);
     expect(second.appliedCount).toBe(0);
 
+    // SC-qp02: queue control state is part of the clean schema, not registration parameters.
+    const pauseColumn = await client.query(
+      `SELECT data_type, is_nullable, column_default FROM information_schema.columns
+       WHERE table_schema = $1 AND table_name = 'queues' AND column_name = 'paused'`,
+      [TEST_SCHEMA],
+    );
+    expect(pauseColumn.rows).toEqual([{ data_type: 'boolean', is_nullable: 'NO', column_default: 'false' }]);
+
     // The new partial indexes should exist; the broad indexes they replace should not.
     expect(await indexExists(client, 'idx_workflow_status_pending')).toBe(true);
     expect(await indexExists(client, 'idx_workflow_status_failed')).toBe(true);

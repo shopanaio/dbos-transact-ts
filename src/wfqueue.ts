@@ -4,7 +4,7 @@ import {
   DEBUG_TRIGGER_BETWEEN_PARTITION_DISPATCHES,
   debugTriggerPoint,
 } from './debugpoint';
-import type { QueueRecord, SystemDatabase } from './system_database';
+import { QueueUnavailableError, type QueueControlState, type QueueRecord, type SystemDatabase } from './system_database';
 import type { GlobalLogger } from './telemetry/logs';
 import { globalParams, RESERVED_QUEUE_NAME_PREFIX } from './utils';
 
@@ -203,6 +203,8 @@ function rateLimitFromRecord(max: number | null, periodSec: number | null): Queu
 
 /** Copy a persisted row's configuration onto a queue instance. */
 function applyRecord(q: WorkflowQueue, record: QueueRecord): void {
+  q.queueId = record.queueId;
+  q.paused = record.paused;
   q.concurrency = record.concurrency ?? undefined;
   q.workerConcurrency = record.workerConcurrency ?? undefined;
   q.rateLimit = rateLimitFromRecord(record.rateLimitMax, record.rateLimitPeriodSec);
@@ -235,6 +237,12 @@ async function refreshFromDb(q: WorkflowQueue): Promise<void> {
  */
 export class WorkflowQueue {
   readonly name: string;
+  queueId!: string;
+  paused!: boolean;
+
+  pause(): Promise<QueueControlState> { return sysDBFor(this).setQueuePaused(this.name, true); }
+  wake(): Promise<QueueControlState> { return sysDBFor(this).setQueuePaused(this.name, false); }
+  getControlState(): Promise<QueueControlState> { return sysDBFor(this).getQueueControlState(this.name); }
   /**
    * Last-known cached values. May be stale for database-backed queues if
    * another process has modified the row. Use getters instead.
@@ -373,6 +381,8 @@ export class WorkflowQueue {
   static recordFromParams(name: string, params: QueueParameters): QueueRecord {
     return {
       name,
+      queueId: '',
+      paused: false,
       concurrency: params.globalConcurrency ?? params.concurrency ?? null,
       workerConcurrency: params.workerConcurrency ?? null,
       rateLimitMax: params.rateLimit ? params.rateLimit.limitPerPeriod : null,
@@ -566,266 +576,305 @@ export function registerInternalQueue(name: string, params: QueueParameters = {}
   return queue;
 }
 
-/** Per-queue runtime scheduling state tracked by the shared dispatcher. */
+/** State is replaceable; reservations outlive every metadata generation. */
 interface QueueRuntimeState {
-  /** Latest config snapshot; replaced in place when a DB-backed row is refreshed. */
   queue: WorkflowQueue;
-  /** Current polling interval in ms after contention backoff / scaleback. */
+  generation: number;
+  phase: 'idle' | 'probing' | 'ready' | 'claiming';
   currentPollingMs: number;
-  /** Epoch ms at which this queue should next be polled. */
   nextPollAt: number;
+  forcePollPending: boolean;
+  waitingForWorkerBudget: boolean;
+  nextBudgetCheckAt: number;
+  token?: symbol;
 }
 
 class WFQueueRunner {
-  /** DBOS's own process-local queues, registered via `registerInternalQueue`. */
-  private readonly internalQueues: Map<string, WorkflowQueue> = new Map();
-
-  /**
-   * Queues fed by this process's own pollers (e.g. a Kafka consumer). Always dispatched,
-   * regardless of any listenQueues filter, so this process executes what it enqueues.
-   */
-  readonly pollerQueueNames: Set<string> = new Set();
-
-  private isRunning: boolean = false;
+  private readonly internalQueues = new Map<string, WorkflowQueue>();
+  readonly pollerQueueNames = new Set<string>();
+  private isRunning = false;
   private abortController?: AbortController;
   private listenQueueNames: Set<string> | null = null;
-  /** Per-queue scheduling state, keyed by queue name. */
-  private readonly states: Map<string, QueueRuntimeState> = new Map();
+  private readonly states = new Map<string, QueueRuntimeState>();
+  private generation = 0;
+  private wakePending = false;
+  private wakeScheduler?: () => void;
+  private static readonly defaultMinPollingIntervalMs = 1000;
+  private static readonly defaultMaxPollingIntervalMs = 120000;
+  private readonly backoffFactor = 2;
+  private readonly scalebackFactor = 0.9;
+  private readonly jitterMin = 0.95;
+  private readonly jitterMax = 1.05;
 
-  private static readonly defaultMinPollingIntervalMs: number = 1000;
-  private static readonly defaultMaxPollingIntervalMs: number = 120000;
-  private static readonly reconcileIntervalMs: number = 1000;
-  private static readonly transitionIntervalMs: number = 1000;
-  private readonly backoffFactor: number = 2.0;
-  private readonly scalebackFactor: number = 0.9;
-  private readonly jitterMin: number = 0.95;
-  private readonly jitterMax: number = 1.05;
-
-  addInternalQueue(queue: WorkflowQueue): void {
-    this.internalQueues.set(queue.name, queue);
-  }
-
-  getInternalQueue(name: string): WorkflowQueue | undefined {
-    return this.internalQueues.get(name);
-  }
-
-  stop() {
+  addInternalQueue(queue: WorkflowQueue): void { this.internalQueues.set(queue.name, queue); }
+  getInternalQueue(name: string): WorkflowQueue | undefined { return this.internalQueues.get(name); }
+  private wake(): void {
     if (!this.isRunning) return;
+    if (this.wakeScheduler) this.wakeScheduler();
+    else this.wakePending = true;
+  }
+  stop(): void {
     this.isRunning = false;
     this.abortController?.abort();
   }
-
-  clearRegistrations() {
+  clearRegistrations(): void {
     this.internalQueues.clear();
     this.pollerQueueNames.clear();
   }
 
-  async dispatchLoop(
-    exec: DBOSExecutor,
-    listenQueuesArg: string[] | null,
-    maxConcurrentQueueDispatches: number = 3,
-  ): Promise<void> {
-    this.isRunning = true;
-    this.states.clear();
-    this.listenQueueNames = listenQueuesArg ? new Set(listenQueuesArg) : null;
-    this.abortController = new AbortController();
-
-    const startNow = Date.now();
-
-    // Internal queues are process-private and bypass the listenQueues filter.
-    for (const q of this.internalQueues.values()) {
-      this.ensureState(q, startNow);
-    }
-
-    // Add pre-launch DB-backed queues now so an immediate enqueue can't race the first reconcile.
-    await this.refreshDbQueues(exec, startNow);
-
-    // Log everything we're now dispatching for, before the loop starts.
-    this.logRunningQueues(exec);
-
-    // One loop drives global maintenance; queue polls run in a bounded set of independent lanes.
-    await this.schedulerLoop(exec, startNow, maxConcurrentQueueDispatches);
-  }
-
-  /** Begin tracking a queue if it isn't already, scheduling its first poll one interval out. */
   private ensureState(queue: WorkflowQueue, now: number): void {
-    if (this.states.has(queue.name)) return;
-    const interval = queue.minPollingIntervalMs ?? WFQueueRunner.defaultMinPollingIntervalMs;
-    this.states.set(queue.name, { queue, currentPollingMs: interval, nextPollAt: now + interval });
-  }
-
-  /** Reconcile DB-backed queues against the queues table in one query: refresh, add, or drop them. */
-  private async refreshDbQueues(exec: DBOSExecutor, now: number): Promise<void> {
-    let records: QueueRecord[];
-    try {
-      records = await exec.systemDatabase.listQueues(exec.systemDatabase.appName);
-    } catch (e) {
-      exec.logger.warn(`Error listing database-backed queues: ${(e as Error).message}`);
+    const existing = this.states.get(queue.name);
+    if (existing && existing.queue.queueId === queue.queueId) {
+      if (JSON.stringify(existing.queue) === JSON.stringify(queue)) return;
+      const waking = existing.queue.paused && !queue.paused;
+      existing.queue = queue;
+      existing.generation = ++this.generation;
+      existing.phase = 'idle';
+      existing.waitingForWorkerBudget = false;
+      existing.nextBudgetCheckAt = now;
+      if (queue.paused) existing.forcePollPending = false;
+      if (waking) {
+        existing.currentPollingMs = queue.minPollingIntervalMs ?? WFQueueRunner.defaultMinPollingIntervalMs;
+        existing.nextPollAt = now;
+        existing.forcePollPending = true;
+      }
       return;
     }
+    const interval = queue.minPollingIntervalMs ?? WFQueueRunner.defaultMinPollingIntervalMs;
+    this.states.set(queue.name, {
+      queue, generation: ++this.generation, phase: 'idle', currentPollingMs: interval,
+      nextPollAt: now + interval, forcePollPending: false,
+      waitingForWorkerBudget: false, nextBudgetCheckAt: now,
+    });
+  }
 
+  private applyMetadata(records: QueueRecord[], names?: string[]): void {
     const present = new Set<string>();
     for (const record of records) {
-      // An internal queue owns its name outright; its process-local configuration wins.
       if (this.internalQueues.has(record.name)) continue;
-      if (
-        this.listenQueueNames !== null &&
-        !this.listenQueueNames.has(record.name) &&
-        !this.pollerQueueNames.has(record.name)
-      ) {
-        continue;
-      }
+      if (this.listenQueueNames && !this.listenQueueNames.has(record.name) && !this.pollerQueueNames.has(record.name)) continue;
       present.add(record.name);
-      const existing = this.states.get(record.name);
-      if (existing) {
-        // Refresh config in place, preserving this queue's polling/backoff state.
-        existing.queue = new WorkflowQueue(record);
-      } else {
-        this.ensureState(new WorkflowQueue(record), now);
-      }
+      this.ensureState(new WorkflowQueue(record), Date.now());
     }
-
-    // A database-backed queue whose row is gone stops being dispatched.
+    const selected = names ? new Set(names) : undefined;
     for (const [name, state] of this.states) {
-      if (!state.queue.databaseBacked) continue;
-      if (!present.has(name)) {
-        exec.logger.info(`Queue '${name}' has been deleted from the database; no longer dispatching it.`);
-        this.states.delete(name);
-      }
+      if (state.queue.databaseBacked && (!selected || selected.has(name)) && !present.has(name)) this.states.delete(name);
     }
   }
 
-  /** Log every queue this process will dispatch for, once at startup after discovery. */
-  private logRunningQueues(exec: DBOSExecutor): void {
-    const names = Array.from(this.states.keys()).filter((n) => !this.internalQueues.has(n));
-    exec.logger.info(`Listening to ${names.length} queues:`);
-    for (const name of names) {
-      logQueue(exec.logger, this.states.get(name)!.queue);
-    }
-  }
+  async dispatchLoop(exec: DBOSExecutor, listenQueuesArg: string[] | null,
+    maxConcurrentQueueDispatches = 3, batchSize = 1000, coalesceMs = 50): Promise<void> {
+    this.isRunning = true;
+    this.states.clear();
+    this.wakePending = false;
+    this.abortController = new AbortController();
+    this.listenQueueNames = listenQueuesArg ? new Set(listenQueuesArg) : null;
+    const signal = this.abortController.signal;
+    const db = exec.systemDatabase;
+    const reservations = new Map<string, symbol>();
+    const claims = new Set<Promise<void>>();
+    let probe: Promise<void> | undefined;
+    let metadata: Promise<void> | undefined;
+    let transition: Promise<void> | undefined;
+    let dirty = new Set<string>();
+    let fullPending = true;
+    let forceAllPending = false;
+    let reconcileAt = 0;
+    let metadataRetryAt = 0;
+    let metadataBackoff = 0;
+    let probeRetryAt = 0;
+    let probeBackoff = 0;
+    let transitionAt = 0;
+    const slot = (deadline: number) => Math.ceil(deadline / coalesceMs) * coalesceMs;
+    const jitter = (ms: number) => ms * (0.95 + Math.random() * 0.1);
+    const hint = (name?: string) => {
+      if (!this.isRunning) return;
+      if (!name || dirty.size >= batchSize) { fullPending = true; forceAllPending = true; dirty.clear(); }
+      else if (!forceAllPending) dirty.add(name);
+      this.wake();
+    };
+    const budgetHint = (name: string) => {
+      if (!this.isRunning) return;
+      const state = this.states.get(name);
+      if (state && !state.queue.paused) state.nextBudgetCheckAt = 0;
+      this.wake();
+    };
+    db.queueControlListeners.add(hint);
+    db.queueBudgetListeners.add(budgetHint);
+    for (const q of this.internalQueues.values()) this.ensureState(q, Date.now());
 
-  /** Reconcile queues and schedule due polls across a bounded number of independent lanes. */
-  private async schedulerLoop(
-    exec: DBOSExecutor,
-    startNow: number,
-    maxConcurrentQueueDispatches: number,
-  ): Promise<void> {
-    const signal = this.abortController!.signal;
-    const inFlightPolls = new Map<string, Promise<void>>();
-    let wakePending = false;
-    let wakeScheduler: (() => void) | undefined;
-    const wake = () => {
-      if (wakeScheduler) {
-        wakeScheduler();
-      } else {
-        wakePending = true;
+    const current = (state: QueueRuntimeState, generation: number) =>
+      this.states.get(state.queue.name) === state && state.generation === generation;
+    const release = (name: string, token: symbol) => {
+      if (reservations.get(name) === token) reservations.delete(name);
+      const state = this.states.get(name);
+      if (state?.token === token) {
+        state.token = undefined;
+        if (state.phase === 'probing' || state.phase === 'claiming') state.phase = 'idle';
       }
     };
-
-    const waitForWakeOrTimeout = async (ms: number): Promise<void> => {
-      if (signal.aborted) return;
-      if (wakePending) {
-        wakePending = false;
-        return;
+    const budgetAvailable = (state: QueueRuntimeState, now: number) => {
+      if (workerBudget(state.queue, db.countRunningWorkflowsForQueue(state.queue.name)) > 0) {
+        state.waitingForWorkerBudget = false;
+        return true;
       }
-      await new Promise<void>((resolve) => {
+      state.waitingForWorkerBudget = true;
+      state.nextBudgetCheckAt = now + 1000;
+      return false;
+    };
+    const wait = async (ms: number) => {
+      if (signal.aborted) return;
+      if (this.wakePending) { this.wakePending = false; return; }
+      await new Promise<void>(resolve => {
         const finish = () => {
           clearTimeout(timer);
-          signal.removeEventListener('abort', onAbort);
-          if (wakeScheduler === finish) wakeScheduler = undefined;
+          signal.removeEventListener('abort', finish);
+          if (this.wakeScheduler === finish) this.wakeScheduler = undefined;
           resolve();
         };
-        const onAbort = () => finish();
-        wakeScheduler = finish;
-        signal.addEventListener('abort', onAbort, { once: true });
         const timer = setTimeout(finish, ms);
+        this.wakeScheduler = finish;
+        signal.addEventListener('abort', finish, { once: true });
       });
     };
 
-    // Discovery already ran during setup; defer the next reconcile a full interval.
-    let lastReconcileAt = startNow;
-    // Global op: run on a fixed cadence, not once per wake (destaggered wakeups would push it to ~N/sec).
-    let lastTransitionAt = 0;
-
-    while (this.isRunning) {
-      const now = Date.now();
-
-      // Reconcile DB-backed queues with a single query, independent of queue count.
-      if (now - lastReconcileAt >= WFQueueRunner.reconcileIntervalMs) {
-        await this.refreshDbQueues(exec, now);
-        lastReconcileAt = now;
-      }
-
-      // Transition delayed workflows at most once per interval — it is global, so one call covers every queue.
-      if (now - lastTransitionAt >= WFQueueRunner.transitionIntervalMs) {
-        try {
-          await exec.systemDatabase.transitionDelayedWorkflows();
-        } catch (e) {
-          exec.logger.warn(`Error transitioning delayed workflows: ${(e as Error).message}`);
-        }
-        lastTransitionAt = now;
-      }
-
-      this.scheduleDueQueues(exec, now, maxConcurrentQueueDispatches, inFlightPolls, wake);
-
-      if (!this.isRunning) break;
-
-      // Sleep until global maintenance or an idle queue's next poll.
-      let nextWakeAt = Math.min(
-        lastReconcileAt + WFQueueRunner.reconcileIntervalMs,
-        lastTransitionAt + WFQueueRunner.transitionIntervalMs,
-      );
-      // Skip queue times while all lanes are busy: a completing poll wakes us, so folding a due-but-unlaned queue in would spin at 0ms.
-      if (inFlightPolls.size < maxConcurrentQueueDispatches) {
-        for (const state of this.states.values()) {
-          if (!inFlightPolls.has(state.queue.name) && state.nextPollAt < nextWakeAt) nextWakeAt = state.nextPollAt;
-        }
-      }
-      const sleepMs = Math.max(0, nextWakeAt - Date.now());
-      await waitForWakeOrTimeout(sleepMs);
-    }
-
-    await Promise.allSettled(Array.from(inFlightPolls.values()));
-  }
-
-  /** Start due queue polls up to the lane limit, in nextPollAt order so the longest-overdue queue goes first. */
-  private scheduleDueQueues(
-    exec: DBOSExecutor,
-    now: number,
-    maxConcurrentQueueDispatches: number,
-    inFlightPolls: Map<string, Promise<void>>,
-    wake: () => void,
-  ): void {
-    if (!this.isRunning) return;
-    // Earliest nextPollAt first: a queue passed over while the lanes were full keeps its older
-    // nextPollAt, so it outranks freshly-scheduled queues on the next pass and cannot be starved.
-    const due = Array.from(this.states.values())
-      .filter((state) => now >= state.nextPollAt && !inFlightPolls.has(state.queue.name))
-      .sort((a, b) => a.nextPollAt - b.nextPollAt);
-    for (const state of due) {
-      if (inFlightPolls.size >= maxConcurrentQueueDispatches) break;
-      inFlightPolls.set(state.queue.name, this.runQueuePoll(exec, state, inFlightPolls, wake));
-    }
-  }
-
-  /** Run one queue's poll while reserving that queue's lane until its backoff state is updated. */
-  private async runQueuePoll(
-    exec: DBOSExecutor,
-    state: QueueRuntimeState,
-    inFlightPolls: Map<string, Promise<void>>,
-    wake: () => void,
-  ): Promise<void> {
-    const queueName = state.queue.name;
-    // pollQueue swallows DB errors, so a rejection here is abnormal: back off instead of scaling back toward the minimum interval.
-    let contentionDetected = true;
     try {
-      contentionDetected = await this.pollQueue(exec, state.queue);
-    } catch (e) {
-      exec.logger.warn(`Unexpected error polling queue ${queueName}: ${(e as Error).message}`);
+      while (this.isRunning) {
+        const now = Date.now();
+        if (!metadata && now >= metadataRetryAt && (fullPending || now >= reconcileAt || dirty.size > 0)) {
+          const full = fullPending || now >= reconcileAt;
+          const names = full ? undefined : [...dirty];
+          const forceNames = dirty;
+          const forceAll = forceAllPending;
+          forceAllPending = false;
+          // New hints belong to the next snapshot, including hints for the same name.
+          dirty = new Set();
+          fullPending = false;
+          metadata = (async () => {
+            try {
+              const records = await db.listQueues(db.appName, names);
+              if (!this.isRunning || signal.aborted) return;
+              this.applyMetadata(records, names);
+              for (const record of records) {
+                const state = this.states.get(record.name);
+                if (!state || state.queue.paused || (!forceAll && !forceNames.has(record.name))) continue;
+                state.generation = ++this.generation;
+                state.phase = 'idle';
+                state.currentPollingMs = state.queue.minPollingIntervalMs ?? WFQueueRunner.defaultMinPollingIntervalMs;
+                state.nextPollAt = Date.now();
+                state.forcePollPending = true;
+                state.nextBudgetCheckAt = 0;
+              }
+              metadataBackoff = 0;
+              metadataRetryAt = 0;
+              if (full) reconcileAt = Date.now() + 1000;
+            } catch (error) {
+              if (full) fullPending = true;
+              if (forceAll) hint();
+              else for (const name of forceNames) hint(name);
+              metadataBackoff = Math.min(1000, metadataBackoff ? metadataBackoff * 2 : 100);
+              metadataRetryAt = Date.now() + jitter(metadataBackoff);
+              exec.logger.warn(`Error refreshing queue metadata: ${String(error)}`);
+            } finally { metadata = undefined; this.wake(); }
+          })();
+        }
+        if (!transition && now >= transitionAt) {
+          transition = (async () => {
+            try { await db.transitionDelayedWorkflows(); }
+            catch (error) { exec.logger.warn(`Error transitioning delayed workflows: ${String(error)}`); }
+            finally { transitionAt = Date.now() + 1000; transition = undefined; this.wake(); }
+          })();
+        }
+        for (const state of this.states.values()) {
+          if (!state.queue.paused && state.waitingForWorkerBudget && now >= state.nextBudgetCheckAt) budgetAvailable(state, now);
+        }
+        const available = () => [...this.states.values()]
+          .filter(s => !s.queue.paused && !s.waitingForWorkerBudget && !reservations.has(s.queue.name))
+          .sort((a, b) => a.nextPollAt - b.nextPollAt);
+
+        for (const state of available()) {
+          if (claims.size >= maxConcurrentQueueDispatches) break;
+          if (state.phase !== 'ready' || !budgetAvailable(state, now)) continue;
+          const name = state.queue.name;
+          const queue = state.queue;
+          const generation = state.generation;
+          const token = Symbol(name);
+          reservations.set(name, token);
+          state.token = token;
+          state.phase = 'claiming';
+          let task!: Promise<void>;
+          task = (async () => {
+            try {
+              // Dispatch committed claims even if metadata changed or stop was requested.
+              const contention = await this.pollQueue(exec, queue);
+              if (current(state, generation)) this.adjustInterval(exec, state, contention);
+            } catch (error) {
+              exec.logger.warn(`Error dispatching queue ${name}: ${String(error)}`);
+              if (current(state, generation)) this.adjustInterval(exec, state, true);
+            } finally {
+              release(name, token);
+              claims.delete(task);
+              this.wake();
+            }
+          })();
+          claims.add(task);
+        }
+        if (!probe && now >= probeRetryAt) {
+          const batch = available().filter(s => s.phase === 'idle' && slot(s.nextPollAt) <= now)
+            .filter(s => budgetAvailable(s, now)).slice(0, batchSize);
+          if (batch.length) {
+            const snapshots = batch.map(state => {
+              const token = Symbol(state.queue.name);
+              reservations.set(state.queue.name, token);
+              state.token = token;
+              state.phase = 'probing';
+              state.forcePollPending = false;
+              return { state, generation: state.generation, token, request: {
+                name: state.queue.name, queueId: state.queue.queueId, generation: state.generation,
+                internal: !state.queue.databaseBacked,
+              }};
+            });
+            probe = (async () => {
+              try {
+                const ready = new Set((await db.findQueuesWithEnqueuedWorkflows(snapshots.map(s => s.request), globalParams.appVersion)).map(r => r.name));
+                probeBackoff = 0;
+                probeRetryAt = 0;
+                for (const { state, generation } of snapshots) {
+                  if (!this.isRunning || !current(state, generation)) continue;
+                  if (ready.has(state.queue.name)) state.phase = 'ready';
+                  else this.adjustInterval(exec, state, false);
+                }
+              } catch (error) {
+                probeBackoff = Math.min(1000, probeBackoff ? probeBackoff * 2 : 100);
+                probeRetryAt = Date.now() + jitter(probeBackoff);
+                exec.logger.warn(`Error probing queue batch: ${String(error)}`);
+              } finally {
+                for (const { state, token } of snapshots) release(state.queue.name, token);
+                probe = undefined;
+                this.wake();
+              }
+            })();
+          }
+        }
+        if (!this.isRunning) break;
+        let next = Infinity;
+        if (!metadata) next = Math.min(next, Math.max(metadataRetryAt, fullPending || dirty.size ? now : reconcileAt));
+        if (!transition) next = Math.min(next, transitionAt);
+        for (const state of this.states.values()) {
+          if (state.queue.paused || reservations.has(state.queue.name)) continue;
+          if (state.waitingForWorkerBudget) next = Math.min(next, state.nextBudgetCheckAt);
+          else if (state.phase === 'ready' && claims.size < maxConcurrentQueueDispatches) next = Math.min(next, now);
+          else if (state.phase === 'idle' && !probe) next = Math.min(next, Math.max(probeRetryAt, slot(state.nextPollAt)));
+        }
+        await wait(Number.isFinite(next) ? Math.max(0, next - Date.now()) : 1000);
+      }
     } finally {
-      this.adjustInterval(exec, state, contentionDetected);
-      inFlightPolls.delete(queueName);
-      wake();
+      this.isRunning = false;
+      db.queueControlListeners.delete(hint);
+      db.queueBudgetListeners.delete(budgetHint);
+      await Promise.allSettled([...claims, ...[probe, metadata, transition].filter((p): p is Promise<void> => p !== undefined)]);
+      this.wakeScheduler = undefined;
+      this.wakePending = false;
     }
   }
 
@@ -875,7 +924,7 @@ class WFQueueRunner {
         const running = sysdb.countRunningWorkflowsForQueue(queue.name);
         let claimed = 0;
         for (const partitionKey of partitionKeys) {
-          if (workerBudget(queue, running + claimed) <= 0) break;
+          if (!this.isRunning || workerBudget(queue, running + claimed) <= 0) break;
           let partitionWfids: string[];
           try {
             partitionWfids = await sysdb.findAndMarkStartableWorkflows(
@@ -897,6 +946,7 @@ class WFQueueRunner {
         }
       }
     } catch (e) {
+      if (e instanceof QueueUnavailableError) return false;
       const err = e as Error;
       // Handle serialization errors and lock contention with backoff
       if (isContentionError(err)) {

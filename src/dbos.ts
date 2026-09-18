@@ -752,6 +752,11 @@ export class DBOS {
   }
 
   /** Get the current workflow ID */
+  /** Persisted execution route, distinct from the queue assigned to child workflows. */
+  static get workflowQueueName(): string | undefined {
+    return getCurrentContextStore()?.workflowQueueName;
+  }
+
   static get workflowID(): string | undefined {
     return getCurrentContextStore()?.workflowId;
   }
@@ -2541,6 +2546,10 @@ export class DBOS {
     );
   }
 
+  static async pauseQueue(name: string) { ensureDBOSIsLaunched('pauseQueue'); return DBOSExecutor.globalInstance!.systemDatabase.setQueuePaused(name, true); }
+  static async wakeQueue(name: string) { ensureDBOSIsLaunched('wakeQueue'); return DBOSExecutor.globalInstance!.systemDatabase.setQueuePaused(name, false); }
+  static async getQueueControlState(name: string) { ensureDBOSIsLaunched('getQueueControlState'); return DBOSExecutor.globalInstance!.systemDatabase.getQueueControlState(name); }
+
   /** Retrieve a database-backed queue by name, or `null` if no row exists. */
   static async retrieveQueue(name: string): Promise<WorkflowQueue | null> {
     ensureDBOSIsLaunched('retrieveQueue');
@@ -2548,7 +2557,7 @@ export class DBOS {
     return record === null ? null : new WorkflowQueue(record);
   }
 
-  /** Delete a database-backed queue. Pending workflows on it are unrecoverable. */
+  /** Delete the queue identity and pause state, retaining workflows. Recreating the name may execute its backlog. */
   static async deleteQueue(name: string): Promise<void> {
     ensureDBOSIsLaunched('deleteQueue');
     await DBOSExecutor.globalInstance!.systemDatabase.deleteQueue(name);

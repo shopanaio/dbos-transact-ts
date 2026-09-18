@@ -125,6 +125,7 @@ export interface application_versions {
 }
 
 export interface queues {
+  paused: boolean;
   queue_id: string;
   name: string;
   concurrency: number | null;

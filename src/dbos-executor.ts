@@ -166,6 +166,8 @@ export interface DBOSConfig {
    * reserves half) leave little of the pool for control-plane operations.
    */
   maxConcurrentQueueDispatches?: number;
+  queuePollingBatchSize?: number;
+  queuePollingCoalesceMs?: number;
   schedulerPollingIntervalMs?: number;
   useListenNotify?: boolean;
   /** Interval (ms) for coalescing LISTEN/NOTIFY notifications (streams and events) off the write path; bounds read latency. Default 10, min 1. */
@@ -233,6 +235,8 @@ export type DBOSConfigInternal = {
 
   schedulerPollingIntervalMs?: number;
   maxConcurrentQueueDispatches?: number;
+  queuePollingBatchSize?: number;
+  queuePollingCoalesceMs?: number;
   useListenNotify: boolean;
   notificationCoalesceMs?: number;
   observabilityQueryTimeoutMs?: number;
@@ -786,6 +790,7 @@ export class DBOSExecutor {
                 workflowTimeoutMS: undefined, // Becomes deadline
                 deadlineEpochMS,
                 workflowId: workflowID,
+                workflowQueueName: params.queueName,
                 logger: this.ctxLogger,
                 curWFFunctionId: undefined,
                 activeStreamReads: 0,
@@ -1236,7 +1241,7 @@ export class DBOSExecutor {
   }
 
   async initEventReceivers(listenQueues: string[] | null) {
-    this.#wfqEnded = wfQueueRunner.dispatchLoop(this, listenQueues, this.config.maxConcurrentQueueDispatches);
+    this.#wfqEnded = wfQueueRunner.dispatchLoop(this, listenQueues, this.config.maxConcurrentQueueDispatches, this.config.queuePollingBatchSize, this.config.queuePollingCoalesceMs);
 
     for (const lcl of getLifecycleListeners()) {
       await lcl.initialize?.();
