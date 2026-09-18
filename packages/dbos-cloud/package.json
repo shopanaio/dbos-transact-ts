@@ -14,9 +14,7 @@
     "build": "tsc --project tsconfig.json",
     "test": "echo \"No tests\""
   },
-  "bin": {
-    "dbos-cloud": "./dist/cli.js"
-  },
+  "bin": "./dist/cli.js",
   "devDependencies": {
     "@types/luxon": "^3.7.1",
     "@types/node": "^20.6.3",

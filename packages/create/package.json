@@ -14,9 +14,7 @@
     "build": "tsc --project tsconfig.json",
     "test": "echo \"No tests\""
   },
-  "bin": {
-    "create": "./dist/cli.js"
-  },
+  "bin": "./dist/cli.js",
   "devDependencies": {
     "@types/node": "^20.6.3",
     "@types/validator": "^13.11.9",

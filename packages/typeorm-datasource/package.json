@@ -16,9 +16,9 @@
     "test": "npm run build && jest --detectOpenHandles"
   },
   "dependencies": {
-    "typeorm": "^0.3.24",
     "pg": "^8.11.3",
-    "superjson": "^1.13"
+    "superjson": "^1.13",
+    "typeorm": "^0.3.24"
   },
   "peerDependencies": {
     "@dbos-inc/dbos-sdk": "*"
