@@ -1,5 +1,6 @@
 {
   "name": "@dbos-inc/dbos-sdk",
+  "private": true,
   "version": "0.0.0-placeholder",
   "description": "Lightweight durable workflows built on Postgres",
   "license": "MIT",
@@ -64,7 +65,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "tsc --project tsconfig.json && npm run --workspaces build",
+    "build": "tsc --project tsconfig.json",
     "lint": "eslint --ignore-pattern **/coverage/ .",
     "test": "npm run build && npm run test:packages && npm run test:unit",
     "test:unit": "jest ./tests --coverage --collectCoverageFrom='src/**/*' --detectOpenHandles",
@@ -78,7 +79,7 @@
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.4",
-    "@dbos-inc/otel": "packages/otel",
+    "@dbos-inc/otel": "workspace:*",
     "@eslint/js": "^9.22.0",
     "@testcontainers/postgresql": "^12.0.1",
     "@types/jest": "^30.0.0",
