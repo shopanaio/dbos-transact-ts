@@ -1,3 +1,5 @@
+import { PostgresSystemDatabase } from '../src/system_database';
+import { withTestClientDatabase } from './system-database-factory';
 import { DBOS } from '../src/';
 import { generateDBOSTestConfig, reexecuteWorkflowById, setUpDBOSTestSysDb } from './helpers';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
@@ -639,7 +641,7 @@ describe('dbos-streaming-tests', () => {
     expect(callCount).toBe(4);
   });
 
-  test('concurrent-writes-to-one-key-take-distinct-offsets', async () => {
+  test('[postgres-only] concurrent-writes-to-one-key-take-distinct-offsets', async () => {
     // Concurrent steps derive the same next offset and race for it, so one loses the primary key.
     // The loser re-derives and appends rather than failing, leaving every value at its own offset.
     const streamKey = 'contended_stream';
@@ -672,10 +674,9 @@ describe('dbos-streaming-tests', () => {
     expect(read.slice().sort()).toEqual(Array.from({ length: writers }, (_, i) => `v${i}`).sort());
 
     // Offsets are dense from 0: a lost race must retry, never skip the offset it failed to take.
-    const offsets = await DBOSExecutor.globalInstance!.systemDatabase.pool.query<{ offset: number }>(
-      `SELECT "offset" FROM dbos.streams WHERE workflow_uuid = $1 AND key = $2 ORDER BY "offset"`,
-      [wfid, streamKey],
-    );
+    const offsets = await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).pool.query<{
+      offset: number;
+    }>(`SELECT "offset" FROM dbos.streams WHERE workflow_uuid = $1 AND key = $2 ORDER BY "offset"`, [wfid, streamKey]);
     // One row per value plus the close marker.
     expect(offsets.rows.map((row) => Number(row.offset))).toEqual(Array.from({ length: writers + 1 }, (_, i) => i));
   });
@@ -692,7 +693,7 @@ describe('dbos-streaming-tests', () => {
     );
     await DBOS.launch();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const wfid = randomUUID();
     await DBOS.withNextWorkflowID(wfid, async () => {
       await writerWorkflow();
@@ -730,7 +731,7 @@ describe('dbos-streaming-tests', () => {
     await expect(gen.next()).rejects.toThrow(DBOSNonExistentWorkflowError);
   });
 
-  test('stream-trigger-dropped-notifier-delivers', async () => {
+  test('[postgres-only] stream-trigger-dropped-notifier-delivers', async () => {
     // The per-row NOTIFY trigger is dropped; assert it's gone and that the coalescing notifier still wakes a blocked reader well under the 1s poll.
     const streamKey = 'notifier_stream';
     const numValues = 3;
@@ -747,7 +748,7 @@ describe('dbos-streaming-tests', () => {
     );
     await DBOS.launch();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // No per-row trigger may remain on the streams table.
     const trigger = await sysdb.pool.query(
       `SELECT 1 FROM pg_trigger t
@@ -775,7 +776,7 @@ describe('dbos-streaming-tests', () => {
     expect(maxLatency).toBeLessThan(500);
   });
 
-  test('read-stream-is-one-round-trip-per-value', async () => {
+  test('[postgres-only] read-stream-is-one-round-trip-per-value', async () => {
     // Each reader tick issues a single joined query fetching value and status together; a regression to two queries would be correct but slow.
     const n = 25;
     const writerWorkflow = DBOS.registerWorkflow(
@@ -795,7 +796,7 @@ describe('dbos-streaming-tests', () => {
     });
 
     // Only the reader joins streams to workflow_status, so background threads sharing the pool can't match; matched loosely, not by table name.
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const spy = jest.spyOn(sysdb.pool, 'query');
     const values: unknown[] = [];
     let queryTexts: string[] = [];
@@ -825,7 +826,7 @@ describe('dbos-streaming-tests', () => {
   test('stream-notifier-drops-unsendable-payload', async () => {
     // A rejected batch (e.g. a payload over the 8000-byte limit) is dropped, not requeued, so a poison payload can't permanently stall the notifier.
     await DBOS.launch();
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const internals = sysdb as unknown as {
       pendingNotifications: Map<string, Set<string>>;
       flushNotifications: () => Promise<void>;
@@ -870,7 +871,7 @@ describe('dbos-streaming-tests', () => {
   test('stream-notifier-survives-flush-error', async () => {
     // An exception escaping a flush must not kill the notifier loop; it logs, backs off, and resumes delivering.
     await DBOS.launch();
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const internals = sysdb as unknown as {
       pendingNotifications: Map<string, Set<string>>;
       flushNotifications: () => Promise<void>;
@@ -919,7 +920,7 @@ describe('dbos-streaming-tests', () => {
     }
   });
 
-  test('event-notifier-delivers-without-workflow-events-trigger', async () => {
+  test('[postgres-only] event-notifier-delivers-without-workflow-events-trigger', async () => {
     // The per-row workflow_events trigger is dropped; assert it's gone and that the coalescing notifier still wakes a blocked getEvent well under the 10s event poll.
     const key = 'notifier_event';
 
@@ -932,7 +933,7 @@ describe('dbos-streaming-tests', () => {
     );
     await DBOS.launch();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // No per-row trigger may remain on the workflow_events table.
     const trigger = await sysdb.pool.query(
       `SELECT 1 FROM pg_trigger t
@@ -959,7 +960,7 @@ describe('dbos-streaming-tests', () => {
     expect(latency).toBeLessThan(3000);
   });
 
-  test('message-notifications-trigger-is-kept', async () => {
+  test('[postgres-only] message-notifications-trigger-is-kept', async () => {
     // Messages keep their in-transaction NOTIFY trigger (they can be sent from processes with no notifier to buffer them); assert it exists and that send still wakes a blocked recv.
     const recvWorkflow = DBOS.registerWorkflow(
       async () => {
@@ -969,7 +970,7 @@ describe('dbos-streaming-tests', () => {
     );
     await DBOS.launch();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // The notifications trigger must be kept.
     const trigger = await sysdb.pool.query(
       `SELECT 1 FROM pg_trigger t
@@ -1119,7 +1120,7 @@ describe('dbos-streaming-tests', () => {
     expect(stepReaderSteps.map((step) => step.name)).toEqual(['checkpoint-read-in-step']);
 
     // Extend the stream now the readers are done, so a live re-read would see more than they did.
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     for (const value of ['d', 'e']) {
       const serval = await serializeValue(value, sysdb.serializer, undefined);
       await sysdb.writeStreamFromStep(writerID, 100, streamKey, serval.serializedValue!, serval.serialization);
@@ -1161,7 +1162,7 @@ describe('dbos-streaming-tests', () => {
       await writerWorkflow();
     });
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await sysdb.writeStreamFromStep(wfid, 100, legacyKey, DBOS_STREAM_CLOSED_SENTINEL, 'portable_json');
 
     const readAll = async (key: string) => {
@@ -1227,7 +1228,9 @@ describe('dbos-streaming-tests', () => {
     expect(readerCalls).toBe(2);
 
     // The bulk fetch the conductor uses agrees too.
-    expect(await DBOSExecutor.globalInstance!.systemDatabase.getAllStreamEntries(wfid)).toEqual({
+    expect(
+      await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).getAllStreamEntries(wfid),
+    ).toEqual({
       [streamKey]: ['v0'],
     });
   });
@@ -1352,7 +1355,7 @@ describe('dbos-streaming-tests', () => {
     }
   });
 
-  test('read-stream-timeout', async () => {
+  test('[postgres-only] read-stream-timeout', async () => {
     // The timeout is per value and the polling interval is per call. The writer stays active and
     // silent, so only the timeout can end a wait, and a value delivered in between restarts the
     // clock rather than counting against a single overall deadline. Notifications are off and the
@@ -1377,7 +1380,7 @@ describe('dbos-streaming-tests', () => {
     DBOS.setConfig(config);
     try {
       await DBOS.launch();
-      const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+      const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
       sysdb.dbPollingIntervalStreamMs = 30000;
 
       const wfid = randomUUID();
@@ -1618,7 +1621,9 @@ describe('dbos-client-streaming-tests', () => {
     config = generateDBOSTestConfig();
     await setUpDBOSTestSysDb(config);
     DBOS.setConfig(config);
-    client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
   });
 
   beforeEach(async () => {});
@@ -1830,7 +1835,7 @@ describe('dbos-client-streaming-tests', () => {
     expect(maxLatency).toBeLessThan(2000);
   });
 
-  test('stream-low-latency-polling-fallback', async () => {
+  test('[postgres-only] stream-low-latency-polling-fallback', async () => {
     // With LISTEN/NOTIFY off the notifier stays idle and no notifications fire; the reader is woken by the polling fallback instead.
     const streamKey = 'polling_fallback_stream';
     const numValues = 3;
@@ -1957,7 +1962,7 @@ describe('dbos-client-streaming-tests', () => {
     }
   });
 
-  test('client-read-stream-is-one-round-trip-per-value', async () => {
+  test('[postgres-only] client-read-stream-is-one-round-trip-per-value', async () => {
     // The client reader fetches value and status in one joined query per tick, like the in-process one.
     const n = 25;
     const writerWorkflow = DBOS.registerWorkflow(

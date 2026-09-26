@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { WorkflowHandle, DBOS, DBOSSerializer } from '../src/';
 import { generateDBOSTestConfig, setUpDBOSTestSysDb, Event } from './helpers';
 import { randomUUID } from 'node:crypto';
@@ -6,7 +7,7 @@ import { DBOSConfig } from '../src/dbos-executor';
 import { Client, Pool, PoolClient } from 'pg';
 import { DBOSWorkflowCancelledError, DBOSAwaitedWorkflowCancelledError, DBOSInitializationError } from '../src/error';
 import assert from 'node:assert';
-import { DBOSClient } from '../dist/src';
+import { DBOSClient } from '../src';
 import { deriveDatabaseUrl, dropPGDatabase, ensurePGDatabase, getDatabaseNameFromUrl } from '../src/database_utils';
 import { sleepConfig } from '../src/utils';
 
@@ -569,7 +570,9 @@ describe('dbos-tests', () => {
       await handleSlow.getResult();
 
       // Test waitFirst via the client
-      const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+      const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+        DBOSClient.create(options),
+      );
       try {
         const handleFast2 = await DBOS.startWorkflow(WaitFirstTestClass).fastWorkflow();
         const handleSlow2 = await DBOS.startWorkflow(WaitFirstTestClass).slowWorkflow();
@@ -602,7 +605,9 @@ describe('dbos-tests', () => {
       await expect(handleFast.getStatus()).resolves.toMatchObject({ status: StatusString.SUCCESS });
       await expect(handleSlow.getStatus()).resolves.toMatchObject({ status: StatusString.SUCCESS });
 
-      const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+      const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+        DBOSClient.create(options),
+      );
       try {
         const handleFast2 = await DBOS.startWorkflow(WaitFirstTestClass).fastWorkflow();
         const handleSlow2 = await DBOS.startWorkflow(WaitFirstTestClass).slowWorkflow();
@@ -629,7 +634,9 @@ describe('dbos-tests', () => {
     test('test_wait_all_empty', async () => {
       await expect(DBOS.waitAll([])).resolves.toEqual([]);
 
-      const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+      const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+        DBOSClient.create(options),
+      );
       try {
         await expect(client.waitAll([])).resolves.toEqual([]);
       } finally {
@@ -711,10 +718,10 @@ describe('dbos-tests', () => {
       await expect(errorHandle.getResult()).rejects.toThrow(message);
 
       // Test the client with a custom serializer
-      const client = await DBOSClient.create({
+      const client = await withTestClientDatabase({
         systemDatabaseUrl: config.systemDatabaseUrl!,
         serializer: jsonSerializer,
-      });
+      }).then((options) => DBOSClient.create(options));
       const clientEnqueue = await client.enqueue(
         { workflowName: 'custom-serializer-test', queueName: queue.name },
         message,
@@ -728,9 +735,9 @@ describe('dbos-tests', () => {
 
       // Verify a client without the custom serializer does not fail,
       // but falls back to returning raw strings
-      const badClient = await DBOSClient.create({
+      const badClient = await withTestClientDatabase({
         systemDatabaseUrl: config.systemDatabaseUrl!,
-      });
+      }).then((options) => DBOSClient.create(options));
       const workflows = await badClient.listWorkflows({});
       assert.equal(workflows.length, 3);
       assert.equal(workflows[0].output, jsonSerializer.stringify(message));
@@ -1021,7 +1028,9 @@ describe('timeout-options-tests', () => {
   });
 
   test('client-getEvent-timeout-number', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       expect(await client.getEvent(randomUUID(), 'key', 0)).toBeNull();
     } finally {
@@ -1030,7 +1039,9 @@ describe('timeout-options-tests', () => {
   });
 
   test('client-getEvent-timeout-options', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       expect(await client.getEvent(randomUUID(), 'key', { timeoutSeconds: 0 })).toBeNull();
     } finally {
@@ -1039,7 +1050,9 @@ describe('timeout-options-tests', () => {
   });
 
   test('client-getEvent-deadline-options', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       expect(await client.getEvent(randomUUID(), 'key', { deadlineEpochMS: Date.now() })).toBeNull();
     } finally {
@@ -1097,10 +1110,10 @@ describe('custom-pool-test', () => {
       await DBOS.send(handle.workflowID, message);
       assert.equal(await handle.getResult(), message);
 
-      const client = await DBOSClient.create({
+      const client = await withTestClientDatabase({
         systemDatabaseUrl: config.systemDatabaseUrl!,
         systemDatabasePool: config.systemDatabasePool,
-      });
+      }).then((options) => DBOSClient.create(options));
       const clientHandle = client.retrieveWorkflow(handle.workflowID);
       assert.equal(await clientHandle.getResult(), message);
 
@@ -1135,7 +1148,9 @@ describe('custom-pool-lifecycle', () => {
   test('destroy ends polling waits instead of leaving them running on the caller pool', async () => {
     const pool = new Pool({ connectionString: systemDatabaseUrl });
     try {
-      const client = await DBOSClient.create({ systemDatabaseUrl, systemDatabasePool: pool });
+      const client = await withTestClientDatabase({ systemDatabaseUrl, systemDatabasePool: pool }).then((options) =>
+        DBOSClient.create(options),
+      );
       await client.registerQueue('custom-pool-lifecycle-queue');
       // Nothing is launched to dequeue it, so this wait would otherwise poll forever.
       const handle = await client.enqueue<() => Promise<string>>({
@@ -1161,7 +1176,11 @@ describe('custom-pool-lifecycle', () => {
 
       const clients: DBOSClient[] = [];
       for (let i = 0; i < 3; i++) {
-        clients.push(await DBOSClient.create({ systemDatabaseUrl, systemDatabasePool: pool }));
+        clients.push(
+          await withTestClientDatabase({ systemDatabaseUrl, systemDatabasePool: pool }).then((options) =>
+            DBOSClient.create(options),
+          ),
+        );
       }
       expect(events.map((e) => pool.listenerCount(e))).toEqual(before);
 
@@ -1195,14 +1214,18 @@ describe('custom-pool-lifecycle', () => {
       const before = events.map((e) => pool.listenerCount(e));
 
       // This one stays up throughout, and must be unaffected by its peers coming and going.
-      const survivor = await DBOSClient.create({ systemDatabaseUrl, systemDatabasePool: pool });
+      const survivor = await withTestClientDatabase({ systemDatabaseUrl, systemDatabasePool: pool }).then((options) =>
+        DBOSClient.create(options),
+      );
 
       // One name, so the contention is on a single row and the work leaves a single row behind.
       const queueName = 'custom-pool-shared-queue';
 
       // Each worker creates, queries, and destroys on its own schedule, so creates and destroys interleave.
       const churn = Array.from({ length: 8 }, async (_, i) => {
-        const client = await DBOSClient.create({ systemDatabaseUrl, systemDatabasePool: pool });
+        const client = await withTestClientDatabase({ systemDatabaseUrl, systemDatabasePool: pool }).then((options) =>
+          DBOSClient.create(options),
+        );
         try {
           // A write, so the connection is held through borrowClient; pool.query() never borrows.
           await client.registerQueue(queueName);

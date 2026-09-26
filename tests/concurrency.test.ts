@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { DBOS, DBOSClient, DBOSConfig } from '../src';
 import { randomUUID } from 'node:crypto';
 import { sleepms } from '../src/utils';
@@ -437,7 +438,9 @@ describe('concurrency-tests', () => {
 
     // Register a DB-backed queue via DBOSClient. Used below to confirm
     // enqueue works for a queue this executor has no local record of.
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       await client.registerQueue(dbBackedQueueName);
     } finally {
@@ -654,7 +657,7 @@ class ConcurrTestClass {
 }
 function compareWFRuns(wfstepsSerial: StepInfo[], wfstepsConcurrent: StepInfo[]) {
   let iconc = 0;
-  for (let i = 0; i < wfstepsSerial.length; ) {
+  for (let i = 0; i < wfstepsSerial.length;) {
     console.log(
       `Output of ${wfstepsConcurrent[iconc].name}@${wfstepsConcurrent[iconc].functionID}: ${JSON.stringify(wfstepsConcurrent[iconc].output)} vs. ${wfstepsSerial[i].name}@${wfstepsSerial[i].functionID}: ${JSON.stringify(wfstepsSerial[i].output)}`,
     );

@@ -1,3 +1,4 @@
+import type { SystemDatabaseFactory } from './system_database';
 import {
   DBOSError,
   DBOSInitializationError,
@@ -31,7 +32,12 @@ import { TelemetryCollector } from './telemetry/collector';
 import { getActiveSpan, runWithTrace, SpanStatusCode, Tracer } from './telemetry/traces';
 import { DBOSContextualLogger, DLogger, GlobalLogger } from './telemetry/logs';
 import { TelemetryExporter } from './telemetry/exporters';
-import { SystemDatabase, type WorkflowStatusInternal, type SystemDatabaseStoredResult } from './system_database';
+import {
+  SystemDatabase,
+  type WorkflowStatusInternal,
+  type SystemDatabaseStoredResult,
+  PostgresSystemDatabase,
+} from './system_database';
 import { randomUUID } from 'node:crypto';
 import {
   getConfiguredInstance,
@@ -95,6 +101,7 @@ export interface DBOSConfig {
   /** Application name; scopes this app's workflows, queues, and schedules in the system database. */
   name: string;
 
+  systemDatabase?: SystemDatabaseFactory;
   systemDatabaseUrl?: string;
   systemDatabasePoolSize?: number;
   /**
@@ -224,6 +231,7 @@ export interface LoggerConfig {
 export type DBOSConfigInternal = {
   name?: string;
 
+  systemDatabase?: SystemDatabaseFactory;
   systemDatabaseUrl: string;
   sysDbPoolSize?: number;
   systemDatabasePollingConcurrency?: number;
@@ -295,20 +303,32 @@ export class DBOSExecutor {
     this.tracer = new Tracer(telemetryCollector, config.telemetry.otelAttributeFormat);
     this.serializer = config.serializer;
 
-    this.logger.debug('Using Postgres system database');
-    this.systemDatabase = new SystemDatabase(
-      this.config.systemDatabaseUrl,
-      this.logger,
-      this.serializer,
-      this.config.sysDbPoolSize,
-      this.config.systemDatabasePool,
-      this.config.systemDatabaseSchemaName,
-      this.config.useListenNotify,
-      this.config.systemDatabasePollingConcurrency,
-      this.config.notificationCoalesceMs,
-      this.appName,
-      this.config.observabilityQueryTimeoutMs,
-    );
+    if (config.systemDatabase && globalParams.appVersion === '') globalParams.appVersion = this.computeAppVersion();
+    this.logger.debug(config.systemDatabase ? 'Using injected system database' : 'Using Postgres system database');
+    this.systemDatabase = config.systemDatabase
+      ? config.systemDatabase({
+          logger: this.logger,
+          serializer: this.serializer,
+          appName: this.appName,
+          executorId: this.executorID,
+          appVersion: globalParams.appVersion,
+          role: 'executor',
+          observabilityQueryTimeoutMs: config.observabilityQueryTimeoutMs,
+          pollingConcurrency: config.systemDatabasePollingConcurrency,
+        })
+      : new PostgresSystemDatabase(
+          this.config.systemDatabaseUrl,
+          this.logger,
+          this.serializer,
+          this.config.sysDbPoolSize,
+          this.config.systemDatabasePool,
+          this.config.systemDatabaseSchemaName,
+          this.config.useListenNotify,
+          this.config.systemDatabasePollingConcurrency,
+          this.config.notificationCoalesceMs,
+          this.appName,
+          this.config.observabilityQueryTimeoutMs,
+        );
 
     new DynamicSchedulerLoop(config.schedulerPollingIntervalMs); // Create the dynamic scheduler, which registers itself.
 
@@ -362,7 +382,8 @@ export class DBOSExecutor {
     }
 
     this.logger.info(`Initializing DBOS (v${globalParams.dbosVersion})`);
-    this.logger.info(`System Database URL: ${maskDatabaseUrl(this.config.systemDatabaseUrl)}`);
+    if (!this.config.systemDatabase)
+      this.logger.info(`System Database URL: ${maskDatabaseUrl(this.config.systemDatabaseUrl)}`);
     this.logger.info(`Executor ID: ${this.executorID}`);
     this.logger.info(`Application version: ${globalParams.appVersion}`);
 
@@ -592,7 +613,7 @@ export class DBOSExecutor {
     // Synchronously set the workflow's status to PENDING and record workflow inputs.
     // We have to do it for all types of workflows because operation_outputs table has a foreign key constraint on workflow status table.
     if (callerFunctionID !== undefined && callerID !== undefined) {
-      const result = await this.systemDatabase.getOperationResultAndThrowIfCancelled(callerID, callerFunctionID);
+      const result = await this.getOperationResult(callerID, callerFunctionID);
       if (result) {
         if (result.error) {
           throw await deserializeResError(result.error, result.serialization ?? null, this.serializer);
@@ -621,6 +642,7 @@ export class DBOSExecutor {
       }
       ires = {
         status: claimed.status,
+        creationOpId: claimed.creationOpId,
         deadlineEpochMS: claimed.deadlineEpochMS,
         shouldExecuteOnThisExecutor: true,
         serialization: claimed.serialization,
@@ -669,6 +691,7 @@ export class DBOSExecutor {
       );
     }
 
+    internalStatus.creationOpId = ires.creationOpId;
     $deadlineEpochMS = ires.deadlineEpochMS;
     shouldExecute = ires.shouldExecuteOnThisExecutor;
 
@@ -785,7 +808,7 @@ export class DBOSExecutor {
         try {
           const callResult = await runWithTrace(span, async () => {
             return await runWithParentContext(
-              pctx,
+              getCurrentContextStore(),
               {
                 workflowTimeoutMS: undefined, // Becomes deadline
                 deadlineEpochMS,
@@ -875,7 +898,28 @@ export class DBOSExecutor {
       (params.queueName === undefined || params.executeWorkflow) &&
       !this.systemDatabase.checkForRunningWorkflow(workflowID)
     ) {
-      const workflowPromise: Promise<R> = runWorkflow();
+      const workflowPromise: Promise<R> = runWithParentContext(
+        pctx,
+        {
+          workflowId: workflowID,
+          creationOpId: ires.creationOpId,
+          prefetchedOperationResults: undefined,
+          prefetchedMaxFunctionId: undefined,
+        },
+        async () => {
+          let prefetched: Map<number, SystemDatabaseStoredResult>;
+          try {
+            prefetched = await this.systemDatabase.prefetchOperationResults(workflowID);
+          } catch (error) {
+            this.tracer.endSpan(span);
+            throw error;
+          }
+          const ctx = getCurrentContextStore()!;
+          ctx.prefetchedOperationResults = prefetched;
+          ctx.prefetchedMaxFunctionId = Array.from(prefetched.keys()).reduce((max, id) => Math.max(max, id), -1);
+          return runWorkflow();
+        },
+      );
 
       this.systemDatabase.registerRunningWorkflow(
         workflowID,
@@ -947,9 +991,7 @@ export class DBOSExecutor {
     };
 
     // Check if this execution previously happened, returning its original result if it did.
-    const checkr = await this.systemDatabase
-      .getOperationResultAndThrowIfCancelled(wfid, funcID)
-      .catch(endSpanAndRethrow);
+    const checkr = await this.getOperationResult(wfid, funcID).catch(endSpanAndRethrow);
     if (checkr) {
       if (checkr.functionName !== stepFnName) {
         endSpanAndRethrow(new DBOSUnexpectedStepError(wfid, funcID, stepFnName, checkr.functionName ?? '?'));
@@ -1136,6 +1178,32 @@ export class DBOSExecutor {
     return new RetrievedHandle(workflowID);
   }
 
+  /**
+   * Checkpoint из prefetch текущего исполнения, включая datasource-шаги. `undefined`, если
+   * `functionID` вне prefetch и checkpoint нужно читать из системной базы.
+   */
+  async getPrefetchedOperationResult(
+    workflowID: string,
+    functionID: number,
+  ): Promise<{ result: SystemDatabaseStoredResult | undefined } | undefined> {
+    const ctx = getCurrentContextStore();
+    if (
+      ctx?.workflowId !== workflowID ||
+      !ctx.prefetchedOperationResults ||
+      functionID > (ctx.prefetchedMaxFunctionId ?? -1)
+    ) {
+      return undefined;
+    }
+    await this.systemDatabase.checkIfCanceledLimited(workflowID);
+    return { result: ctx.prefetchedOperationResults.get(functionID) };
+  }
+
+  async getOperationResult(workflowID: string, functionID: number): Promise<SystemDatabaseStoredResult | undefined> {
+    const prefetched = await this.getPrefetchedOperationResult(workflowID, functionID);
+    if (prefetched) return prefetched.result;
+    return this.systemDatabase.getOperationResultAndThrowIfCancelled(workflowID, functionID);
+  }
+
   async runInternalStep<T>(
     callback: () => Promise<T>,
     functionName: string,
@@ -1144,7 +1212,7 @@ export class DBOSExecutor {
     childWfId?: string,
   ): Promise<T> {
     const startTime = Date.now();
-    const result = await this.systemDatabase.getOperationResultAndThrowIfCancelled(workflowID, functionID);
+    const result = await this.getOperationResult(workflowID, functionID);
     if (result) {
       if (result.functionName !== functionName) {
         throw new DBOSUnexpectedStepError(workflowID, functionID, functionName, result.functionName!);
@@ -1241,7 +1309,13 @@ export class DBOSExecutor {
   }
 
   async initEventReceivers(listenQueues: string[] | null) {
-    this.#wfqEnded = wfQueueRunner.dispatchLoop(this, listenQueues, this.config.maxConcurrentQueueDispatches, this.config.queuePollingBatchSize, this.config.queuePollingCoalesceMs);
+    this.#wfqEnded = wfQueueRunner.dispatchLoop(
+      this,
+      listenQueues,
+      this.config.maxConcurrentQueueDispatches,
+      this.config.queuePollingBatchSize,
+      this.config.queuePollingCoalesceMs,
+    );
 
     for (const lcl of getLifecycleListeners()) {
       await lcl.initialize?.();

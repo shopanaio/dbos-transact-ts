@@ -1,3 +1,4 @@
+import { withTestSystemDatabase } from '../../../tests/system-database-factory';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { Client, Pool } from 'pg';
 import { PrismaDataSource } from '..';
@@ -35,7 +36,7 @@ describe('PrismaDataSource', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'prisma-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'prisma-ds-test' }));
     await DBOS.launch();
   });
 
@@ -582,7 +583,7 @@ describe('PrismaDataSourceCreateTxC', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'prisma-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'prisma-ds-test' }));
     await DBOS.launch();
   });
 

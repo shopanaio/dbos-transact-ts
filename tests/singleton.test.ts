@@ -1,3 +1,5 @@
+import { PostgresSystemDatabase } from '../src/system_database';
+import { withTestClientDatabase } from './system-database-factory';
 import { DBOS, DBOSClient } from '../src';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
 import { DBOSQueueDuplicatedError } from '../src/error';
@@ -152,7 +154,7 @@ describe('singleton workflows', () => {
       duplicationPolicy: 'return-existing',
     }).gatedWorkflow('first');
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const original = sysdb.getDeduplicatedWorkflow.bind(sysdb);
     let calls = 0;
     sysdb.getDeduplicatedWorkflow = async (queueName: string, dID: string) => {
@@ -197,7 +199,7 @@ describe('singleton workflows', () => {
 
     // Force the dedup lookup to miss once so the retry loop iterates twice on the
     // original run.
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const original = sysdb.getDeduplicatedWorkflow.bind(sysdb);
     let calls = 0;
     sysdb.getDeduplicatedWorkflow = async (qn: string, dID: string) => {
@@ -295,7 +297,7 @@ describe('singleton workflows', () => {
     // Force iter 1's INSERT to fail with a dedup violation, then succeed on iter 2.
     // Pair with getDeduplicatedWorkflow returning null so the wrapper falls through
     // to "loop and try to claim the slot."
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const originalInit = sysdb.initWorkflowStatus.bind(sysdb);
     const originalLookup = sysdb.getDeduplicatedWorkflow.bind(sysdb);
     let initCalls = 0;
@@ -331,7 +333,7 @@ describe('singleton workflows', () => {
 
   test('client enqueue with duplicationPolicy: return-existing attaches', async () => {
     const dedupID = `client_return_existing_${Date.now()}`;
-    const client = await DBOSClient.create({ systemDatabaseUrl });
+    const client = await withTestClientDatabase({ systemDatabaseUrl }).then((options) => DBOSClient.create(options));
 
     try {
       const handle1 = await client.enqueue<typeof SingletonTest.gatedWorkflow>(
@@ -367,7 +369,7 @@ describe('singleton workflows', () => {
   });
 
   test('client enqueue with duplicationPolicy: return-existing requires deduplicationID', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl });
+    const client = await withTestClientDatabase({ systemDatabaseUrl }).then((options) => DBOSClient.create(options));
     try {
       await expect(
         client.enqueue<typeof SingletonTest.gatedWorkflow>(

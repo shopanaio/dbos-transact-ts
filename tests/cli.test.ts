@@ -7,7 +7,7 @@ import { execSync } from 'child_process';
 import { Client } from 'pg';
 import { generateDBOSTestConfig } from './helpers';
 import { DBOS } from '../src';
-import { DBOSConfig } from '../dist/src';
+import { DBOSConfig } from '../src';
 
 interface ExistenceCheck {
   exists: boolean;

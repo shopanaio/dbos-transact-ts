@@ -98,7 +98,7 @@ import {
   VersionInfo,
 } from './system_database';
 import { readStreamCore, readStreamOffsetCore } from './streams';
-import { PoolClient } from 'pg';
+import type { SystemDatabaseStoredResult, SystemTransaction } from './system_database';
 import {
   WorkflowSchedule,
   ScheduledWorkflowFn,
@@ -417,13 +417,13 @@ export async function getResultInternal<T>(
 
 /**
  * Like runInternalStep, but when called from within a workflow, the callback and the step
- * result recording run in the same database transaction (via runTransactionalStep).
- * The callback receives a PoolClient that should be passed to any SystemDatabase
+ * result recording run in the same database transaction (via runSystemMutationStep).
+ * The callback receives a SystemTransaction that should be passed to any SystemDatabase
  * methods so they participate in the same transaction.
  * Outside a workflow, the callback is called directly with `undefined` as the client.
  */
-export async function runTransactionalInternalStep<T>(
-  callback: (client: PoolClient | undefined) => Promise<T>,
+export async function runSystemMutationStep<T>(
+  callback: (client: SystemTransaction | undefined) => Promise<T>,
   funcName: string,
 ): Promise<T> {
   if (DBOS.isWithinWorkflow()) {
@@ -433,23 +433,34 @@ export async function runTransactionalInternalStep<T>(
       const executor = DBOSExecutor.globalInstance!;
       // Reserve the function ID synchronously, before any await.
       const functionID = functionIDGetIncrement();
+      // The mutation step reads its own checkpoint in the transaction; only a prefetch hit skips it.
+      const cached = (await executor.getPrefetchedOperationResult(DBOS.workflowID!, functionID))?.result;
+      if (cached) {
+        if (cached.functionName !== funcName)
+          throw new DBOSUnexpectedStepError(DBOS.workflowID!, functionID, funcName, cached.functionName!);
+        return DBOSExecutor.reviveResultOrError<T>(cached, executor.serializer);
+      }
       let freshResult: T;
+      let mutated = false;
 
-      const stored = await executor.systemDatabase.runTransactionalStep(
+      const stored = await executor.systemDatabase.runSystemMutationStep(
         DBOS.workflowID!,
         functionID,
         funcName,
         async (client) => {
           freshResult = await callback(client);
+          mutated = true;
           return await executor.serializer.stringify(freshResult !== undefined ? freshResult : null);
         },
       );
 
-      if (stored !== undefined) {
-        if (stored.functionName !== funcName) {
-          throw new DBOSUnexpectedStepError(DBOS.workflowID!, functionID, funcName, stored.functionName!);
+      if (!mutated) {
+        // The callback did not run, so the backend returned the recorded checkpoint.
+        const recorded = stored as SystemDatabaseStoredResult;
+        if (recorded.functionName !== funcName) {
+          throw new DBOSUnexpectedStepError(DBOS.workflowID!, functionID, funcName, recorded.functionName!);
         }
-        return await DBOSExecutor.reviveResultOrError<T>(stored, executor.serializer);
+        return await DBOSExecutor.reviveResultOrError<T>(recorded, executor.serializer);
       }
       return freshResult!;
     } else {
@@ -1612,7 +1623,7 @@ export class DBOS {
     const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
     yield* readStreamCore<T>(sysdb, sysdb.serializer, workflowID, key, {
       offset: resolveStreamOffset(options),
-      pollingIntervalMs: resolveStreamPollingIntervalMs(options) ?? sysdb.dbPollingIntervalStreamMs,
+      pollingIntervalMs: sysdb.resolveWaitPollingIntervalMs('stream', resolveStreamPollingIntervalMs(options)),
       timeoutMS: resolveStreamTimeoutMS(options),
       functionName: DBOS_FUNCNAME_READSTREAM,
       checkpoint: true,
@@ -1641,7 +1652,7 @@ export class DBOS {
     const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
     return await readStreamOffsetCore<T>(sysdb, sysdb.serializer, workflowID, key, {
       offset: resolveStreamOffset({ ...options, offset }),
-      pollingIntervalMs: resolveStreamPollingIntervalMs(options) ?? sysdb.dbPollingIntervalStreamMs,
+      pollingIntervalMs: sysdb.resolveWaitPollingIntervalMs('stream', resolveStreamPollingIntervalMs(options)),
       timeoutMS: resolveStreamTimeoutMS(options),
       functionName: DBOS_FUNCNAME_READSTREAMOFFSET,
       checkpoint: true,
@@ -2267,7 +2278,7 @@ export class DBOS {
       applicationName: globalParams.appName,
     };
 
-    await runTransactionalInternalStep(
+    await runSystemMutationStep(
       (client) => DBOSExecutor.globalInstance!.systemDatabase.createSchedule(schedInternal, client),
       'DBOS.createSchedule',
     );
@@ -2286,7 +2297,7 @@ export class DBOS {
   }): Promise<WorkflowSchedule[]> {
     ensureDBOSIsLaunched('listSchedules');
     const serializer = DBOSExecutor.globalInstance!.serializer;
-    const results = await runTransactionalInternalStep(
+    const results = await runSystemMutationStep(
       (client) => DBOSExecutor.globalInstance!.systemDatabase.listSchedules(filters, client),
       'DBOS.listSchedules',
     );
@@ -2296,7 +2307,7 @@ export class DBOS {
   static async getSchedule(name: string): Promise<WorkflowSchedule | null> {
     ensureDBOSIsLaunched('getSchedule');
     const serializer = DBOSExecutor.globalInstance!.serializer;
-    const result = await runTransactionalInternalStep(
+    const result = await runSystemMutationStep(
       (client) => DBOSExecutor.globalInstance!.systemDatabase.getSchedule(name, client),
       'DBOS.getSchedule',
     );
@@ -2305,7 +2316,7 @@ export class DBOS {
 
   static async deleteSchedule(name: string): Promise<void> {
     ensureDBOSIsLaunched('deleteSchedule');
-    await runTransactionalInternalStep(
+    await runSystemMutationStep(
       (client) => DBOSExecutor.globalInstance!.systemDatabase.deleteSchedule(name, client),
       'DBOS.deleteSchedule',
     );
@@ -2313,7 +2324,7 @@ export class DBOS {
 
   static async pauseSchedule(name: string): Promise<void> {
     ensureDBOSIsLaunched('pauseSchedule');
-    await runTransactionalInternalStep(
+    await runSystemMutationStep(
       (client) => DBOSExecutor.globalInstance!.systemDatabase.setScheduleStatus(name, 'PAUSED', client),
       'DBOS.pauseSchedule',
     );
@@ -2321,7 +2332,7 @@ export class DBOS {
 
   static async resumeSchedule(name: string): Promise<void> {
     ensureDBOSIsLaunched('resumeSchedule');
-    await runTransactionalInternalStep(
+    await runSystemMutationStep(
       (client) => DBOSExecutor.globalInstance!.systemDatabase.setScheduleStatus(name, 'ACTIVE', client),
       'DBOS.resumeSchedule',
     );
@@ -2352,7 +2363,7 @@ export class DBOS {
     if (updates.automaticBackfill !== undefined) internalUpdates.automaticBackfill = updates.automaticBackfill;
     if (updates.cronTimezone !== undefined) internalUpdates.cronTimezone = updates.cronTimezone;
     if (updates.queueName !== undefined) internalUpdates.queueName = updates.queueName;
-    await runTransactionalInternalStep(
+    await runSystemMutationStep(
       (client) => DBOSExecutor.globalInstance!.systemDatabase.updateSchedule(name, internalUpdates, client),
       'DBOS.updateSchedule',
     );
@@ -2546,9 +2557,18 @@ export class DBOS {
     );
   }
 
-  static async pauseQueue(name: string) { ensureDBOSIsLaunched('pauseQueue'); return DBOSExecutor.globalInstance!.systemDatabase.setQueuePaused(name, true); }
-  static async wakeQueue(name: string) { ensureDBOSIsLaunched('wakeQueue'); return DBOSExecutor.globalInstance!.systemDatabase.setQueuePaused(name, false); }
-  static async getQueueControlState(name: string) { ensureDBOSIsLaunched('getQueueControlState'); return DBOSExecutor.globalInstance!.systemDatabase.getQueueControlState(name); }
+  static async pauseQueue(name: string) {
+    ensureDBOSIsLaunched('pauseQueue');
+    return DBOSExecutor.globalInstance!.systemDatabase.setQueuePaused(name, true);
+  }
+  static async wakeQueue(name: string) {
+    ensureDBOSIsLaunched('wakeQueue');
+    return DBOSExecutor.globalInstance!.systemDatabase.setQueuePaused(name, false);
+  }
+  static async getQueueControlState(name: string) {
+    ensureDBOSIsLaunched('getQueueControlState');
+    return DBOSExecutor.globalInstance!.systemDatabase.getQueueControlState(name);
+  }
 
   /** Retrieve a database-backed queue by name, or `null` if no row exists. */
   static async retrieveQueue(name: string): Promise<WorkflowQueue | null> {

@@ -1,3 +1,6 @@
+import { globalParams } from './utils';
+import { validateSystemDatabaseFactory } from './system_database_factory';
+import type { SystemDatabaseFactory } from './system_database';
 import {
   SystemDatabase,
   type DuplicationPolicy,
@@ -10,6 +13,7 @@ import {
   type DebounceResult,
   DBOS_FUNCNAME_READSTREAM,
   DEFAULT_POOL_SIZE,
+  PostgresSystemDatabase,
 } from './system_database';
 
 import { DLogger, GlobalLogger } from './telemetry/logs';
@@ -144,24 +148,37 @@ export class DBOSClient {
     logger?: DLogger,
     applicationName?: string,
     observabilityQueryTimeoutMs?: number,
+    systemDatabase?: SystemDatabaseFactory,
   ) {
     this.logger = new GlobalLogger(undefined, logger ? { logger } : undefined);
-    this.systemDatabase = new SystemDatabase(
-      systemDatabaseUrl,
-      this.logger,
-      serializer,
-      systemDatabasePoolSize ?? DEFAULT_POOL_SIZE,
-      systemDatabasePool,
-      systemDatabaseSchemaName,
-      // The client does not run a background notifications listener
-      false,
-      systemDatabasePollingConcurrency,
-      undefined,
-      applicationName,
-      observabilityQueryTimeoutMs,
-    );
+    this.systemDatabase = systemDatabase
+      ? systemDatabase({
+          logger: this.logger,
+          serializer,
+          appName: applicationName,
+          executorId: globalParams.executorID,
+          appVersion: globalParams.appVersion,
+          role: 'client',
+          observabilityQueryTimeoutMs,
+          pollingConcurrency: systemDatabasePollingConcurrency,
+        })
+      : new PostgresSystemDatabase(
+          systemDatabaseUrl,
+          this.logger,
+          serializer,
+          systemDatabasePoolSize ?? DEFAULT_POOL_SIZE,
+          systemDatabasePool,
+          systemDatabaseSchemaName,
+          // The client does not run a background notifications listener
+          false,
+          systemDatabasePollingConcurrency,
+          undefined,
+          applicationName,
+          observabilityQueryTimeoutMs,
+        );
     // Control writes notify executors even though this client has no listener.
-    this.systemDatabase.queueControlNotificationsEnabled = true;
+    if (this.systemDatabase instanceof PostgresSystemDatabase)
+      this.systemDatabase.queueControlNotificationsEnabled = true;
   }
 
   /**
@@ -178,6 +195,9 @@ export class DBOSClient {
    * @returns A Promise that resolves with the DBOSClient instance.
    */
   static async create({
+    systemDatabase,
+    useListenNotify,
+    notificationCoalesceMs,
     systemDatabaseUrl,
     systemDatabasePool,
     serializer,
@@ -188,7 +208,10 @@ export class DBOSClient {
     applicationName,
     observabilityQueryTimeoutMs,
   }: {
-    systemDatabaseUrl: string;
+    systemDatabase?: SystemDatabaseFactory;
+    systemDatabaseUrl?: string;
+    useListenNotify?: boolean;
+    notificationCoalesceMs?: number;
     systemDatabasePool?: Pool;
     serializer?: DBOSSerializer;
     systemDatabaseSchemaName?: string;
@@ -198,8 +221,18 @@ export class DBOSClient {
     applicationName?: string;
     observabilityQueryTimeoutMs?: number;
   }): Promise<DBOSClient> {
-    const client = new DBOSClient(
+    validateSystemDatabaseFactory({
+      systemDatabase,
       systemDatabaseUrl,
+      systemDatabasePool,
+      systemDatabasePoolSize,
+      systemDatabaseSchemaName,
+      useListenNotify,
+      notificationCoalesceMs,
+    });
+    if (!systemDatabase && !systemDatabaseUrl) throw new DBOSError('systemDatabaseUrl or systemDatabase is required');
+    const client = new DBOSClient(
+      systemDatabaseUrl ?? '',
       systemDatabasePool,
       serializer ?? DBOSJSON,
       systemDatabaseSchemaName,
@@ -208,8 +241,17 @@ export class DBOSClient {
       logger,
       applicationName,
       observabilityQueryTimeoutMs,
+      systemDatabase,
     );
-    return Promise.resolve(client);
+    if (systemDatabase) {
+      try {
+        await client.systemDatabase.init(false);
+      } catch (error) {
+        await client.systemDatabase.destroy().catch(() => {});
+        throw error;
+      }
+    }
+    return client;
   }
 
   /** The application this client acts on behalf of; undefined if it writes unclaimed rows. */
@@ -404,7 +446,9 @@ export class DBOSClient {
       // A unique violation aborts the caller's transaction, so recovering the existing ID would need a new one.
       throw new DBOSError("`duplicationPolicy: 'return-existing'` is not supported in a caller-owned transaction");
     }
-    await this.systemDatabase.initWorkflowStatus(internalStatus, null, client);
+    if (!(this.systemDatabase instanceof PostgresSystemDatabase))
+      throw new DBOSError('enqueueInTransaction requires PostgreSQL');
+    await this.systemDatabase.enqueueInTransaction(internalStatus, client);
     return internalStatus.workflowUUID;
   }
 
@@ -450,9 +494,15 @@ export class DBOSClient {
     return queue;
   }
 
-  async pauseQueue(name: string) { return this.systemDatabase.setQueuePaused(name, true); }
-  async wakeQueue(name: string) { return this.systemDatabase.setQueuePaused(name, false); }
-  async getQueueControlState(name: string) { return this.systemDatabase.getQueueControlState(name); }
+  async pauseQueue(name: string) {
+    return this.systemDatabase.setQueuePaused(name, true);
+  }
+  async wakeQueue(name: string) {
+    return this.systemDatabase.setQueuePaused(name, false);
+  }
+  async getQueueControlState(name: string) {
+    return this.systemDatabase.getQueueControlState(name);
+  }
 
   /** Retrieve a database-backed queue by name, or `null` if no row exists. */
   async retrieveQueue(name: string): Promise<WorkflowQueue | null> {
@@ -523,7 +573,9 @@ export class DBOSClient {
     options?: ClientSendOptions,
   ): Promise<void> {
     const sermsg = await serializeValue(message, this.serializer, options?.serializationType);
-    await this.systemDatabase.sendDirect(
+    if (!(this.systemDatabase instanceof PostgresSystemDatabase))
+      throw new DBOSError('sendInTransaction requires PostgreSQL');
+    await this.systemDatabase.sendInTransaction(
       destinationID,
       sermsg.serializedValue,
       topic,
@@ -667,7 +719,10 @@ export class DBOSClient {
     // A client never runs inside a workflow, so its reads are not checkpointed.
     yield* readStreamCore<T>(this.systemDatabase, this.serializer, workflowID, key, {
       offset: resolveStreamOffset(options),
-      pollingIntervalMs: resolveStreamPollingIntervalMs(options) ?? this.systemDatabase.dbPollingIntervalStreamMs,
+      pollingIntervalMs: this.systemDatabase.resolveWaitPollingIntervalMs(
+        'stream',
+        resolveStreamPollingIntervalMs(options),
+      ),
       timeoutMS: resolveStreamTimeoutMS(options),
       functionName: DBOS_FUNCNAME_READSTREAM,
       checkpoint: false,
@@ -692,7 +747,10 @@ export class DBOSClient {
   ): Promise<T> {
     return await readStreamOffsetCore<T>(this.systemDatabase, this.serializer, workflowID, key, {
       offset: resolveStreamOffset({ ...options, offset }),
-      pollingIntervalMs: resolveStreamPollingIntervalMs(options) ?? this.systemDatabase.dbPollingIntervalStreamMs,
+      pollingIntervalMs: this.systemDatabase.resolveWaitPollingIntervalMs(
+        'stream',
+        resolveStreamPollingIntervalMs(options),
+      ),
       timeoutMS: resolveStreamTimeoutMS(options),
       functionName: DBOS_FUNCNAME_READSTREAM,
       checkpoint: false,

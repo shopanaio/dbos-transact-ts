@@ -1,3 +1,4 @@
+import { validateSystemDatabaseFactory } from './system_database_factory';
 import { globalParams, readFile } from './utils';
 import { DBOSConfig, DBOSRuntimeConfig, DBOSConfigInternal } from './dbos-executor';
 import YAML from 'yaml';
@@ -144,6 +145,7 @@ export function getDbosConfig(
 }
 
 export function translateDbosConfig(options: Partial<DBOSConfig>): DBOSConfigInternal {
+  validateSystemDatabaseFactory(options);
   for (const key of ['queuePollingBatchSize', 'queuePollingCoalesceMs'] as const) {
     const value = options[key];
     if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
@@ -164,14 +166,17 @@ export function translateDbosConfig(options: Partial<DBOSConfig>): DBOSConfigInt
     throw new Error('notificationCoalesceMs must be a finite number at least 1 millisecond');
   }
   validateObservabilityQueryTimeoutMs(options.observabilityQueryTimeoutMs);
-  const systemDatabaseUrl = getSystemDatabaseUrl({
-    system_database_url: options.systemDatabaseUrl,
-    name: options.name,
-  });
+  const systemDatabaseUrl = options.systemDatabase
+    ? ''
+    : getSystemDatabaseUrl({
+        system_database_url: options.systemDatabaseUrl,
+        name: options.name,
+      });
 
   return {
     name: options.name,
     systemDatabaseUrl,
+    systemDatabase: options.systemDatabase,
     sysDbPoolSize: options.systemDatabasePoolSize,
     systemDatabasePollingConcurrency: options.systemDatabasePollingConcurrency,
     systemDatabasePool: options.systemDatabasePool,

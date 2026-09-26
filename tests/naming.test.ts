@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { spawnSync } from 'node:child_process';
 import { ConfiguredInstance, DBOS, DBOSClient, DBOSConfig } from '../src';
 import { getAllRegisteredClassNames, getAllRegisteredFunctions } from '../src/decorators';
@@ -117,7 +118,9 @@ describe('rename_tests', () => {
       expect(resnew).toBe(1000);
     }
 
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
 
     // Tests client + enqueue
     try {

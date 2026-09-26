@@ -1,8 +1,9 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { randomUUID } from 'node:crypto';
 import { Client, Notification } from 'pg';
 import { DBOS, DBOSClient, QueueControlError } from '../src';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
-import { SystemDatabase, QueueUnavailableError, QueueReadinessRequest } from '../src/system_database';
+import { PostgresSystemDatabase, QueueUnavailableError, QueueReadinessRequest } from '../src/system_database';
 import { WorkflowQueue, QueueParameters } from '../src/wfqueue';
 import { DBOSJSON } from '../src/serialization';
 import { globalParams, INTERNAL_QUEUE_NAME } from '../src/utils';
@@ -17,9 +18,9 @@ import {
 const APP = 'queue-control-tests';
 const routeWorkflow = DBOS.registerWorkflow(async () => DBOS.workflowQueueName, { name: 'queueControlRoute' });
 
-describe('persisted queue control and readiness', () => {
+describe('[postgres-only] persisted queue control and readiness', () => {
   let config: DBOSConfig;
-  let db: SystemDatabase;
+  let db: PostgresSystemDatabase;
   let observer: Client;
   let notifications: Notification[];
   let clients: DBOSClient[];
@@ -33,7 +34,9 @@ describe('persisted queue control and readiness', () => {
   });
   const queue = (params: QueueParameters = {}) => DBOS.registerQueue(`q-${randomUUID()}`, params);
   async function client(applicationName?: string) {
-    const c = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl!, applicationName });
+    const c = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl!, applicationName }).then(
+      (options) => DBOSClient.create(options),
+    );
     clients.push(c);
     return c;
   }
@@ -86,7 +89,7 @@ describe('persisted queue control and readiness', () => {
     await setUpDBOSTestSysDb(config);
     DBOS.setConfig(config);
     await DBOS.launch();
-    db = DBOSExecutor.globalInstance!.systemDatabase;
+    db = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     observer = new Client({ connectionString: config.systemDatabaseUrl });
     await observer.connect();
     await observer.query('LISTEN dbos_queue_control_channel');
@@ -113,7 +116,7 @@ describe('persisted queue control and readiness', () => {
     await DBOS.shutdown();
   });
 
-  test('SC-qp02/04: clean migration defaults, control reads, upsert, setters and recreation', async () => {
+  test('[postgres-only] SC-qp02/04: clean migration defaults, control reads, upsert, setters and recreation', async () => {
     const q = await queue();
     expect(q.queueId).toBeTruthy();
     expect(q.paused).toBe(false);
@@ -177,7 +180,7 @@ describe('persisted queue control and readiness', () => {
     expect((await db.getQueue(shared.name))?.applicationName).toBeUndefined();
   });
 
-  test('SC-qp05: ownership assignment and control write serialize on the same row', async () => {
+  test('[postgres-only] SC-qp05: ownership assignment and control write serialize on the same row', async () => {
     const c = await client();
     const q = await c.registerQueue(`shared-${randomUUID()}`);
     const lock = await db.pool.connect();
@@ -285,7 +288,7 @@ describe('persisted queue control and readiness', () => {
     }
   });
 
-  test('SC-qp06: 1000 readiness requests use one statement and return only eligible identities', async () => {
+  test('[postgres-only] SC-qp06: 1000 readiness requests use one statement and return only eligible identities', async () => {
     const q = await queue();
     const empty = await queue();
     const paused = await queue();
@@ -326,14 +329,16 @@ describe('persisted queue control and readiness', () => {
       await db.pool.query('DELETE FROM dbos.workflow_status WHERE workflow_uuid = $1', [own]);
       if (mode === 'unregistered') await db.pool.query('DELETE FROM dbos.application_versions');
       const reader =
-        mode === 'nameless' ? new SystemDatabase(config.systemDatabaseUrl!, db.logger, DBOSJSON, 10, db.pool) : db;
+        mode === 'nameless'
+          ? new PostgresSystemDatabase(config.systemDatabaseUrl!, db.logger, DBOSJSON, 10, db.pool)
+          : db;
       const found = await reader.findQueuesWithEnqueuedWorkflows([request(q)], version());
       expect(found).toEqual(mode === 'old' ? [] : [request(q)]);
       expect((await row(unversioned)).status).toBe('ENQUEUED');
     },
   );
 
-  test('SC-qp06: a foreign latest version does not demote this app; internal trust is explicit', async () => {
+  test('[postgres-only] SC-qp06: a foreign latest version does not demote this app; internal trust is explicit', async () => {
     const q = await queue();
     await insert(q.name, { version: null });
     await db.createApplicationVersion('foreign', 'peer');
@@ -473,7 +478,7 @@ describe('persisted queue control and readiness', () => {
     },
   );
 
-  test('SC-qp03: concurrent control commands serialize and wake never changes queue ownership', async () => {
+  test('[postgres-only] SC-qp03: concurrent control commands serialize and wake never changes queue ownership', async () => {
     const q = await queue();
     const lock = await db.pool.connect();
     releases.push(() => {
@@ -491,7 +496,7 @@ describe('persisted queue control and readiness', () => {
     expect((await db.getQueue(q.name))?.applicationName).toBe(APP);
   });
 
-  test('SC-qp06: persisted queue ownership independently restricts readiness and claims', async () => {
+  test('[postgres-only] SC-qp06: persisted queue ownership independently restricts readiness and claims', async () => {
     const q = await queue();
     await insert(q.name);
     await db.pool.query('UPDATE dbos.queues SET application_name = $1 WHERE name = $2', ['foreign', q.name]);
@@ -534,14 +539,14 @@ describe('persisted queue control and readiness', () => {
     }
   });
 
-  test('SC-qp02/09: pause and delayed backlog survive restart without LISTEN/NOTIFY', async () => {
+  test('[postgres-only] SC-qp02/09: pause and delayed backlog survive restart without LISTEN/NOTIFY', async () => {
     const q = await queue({ minPollingIntervalMs: 10 });
     await q.pause();
     const h = await DBOS.startWorkflow(routeWorkflow, { queueName: q.name, enqueueOptions: { delaySeconds: 3600 } })();
     await DBOS.shutdown();
     DBOS.setConfig({ ...config, listenQueues: [q.name], useListenNotify: false });
     await DBOS.launch();
-    db = DBOSExecutor.globalInstance!.systemDatabase;
+    db = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     expect(await DBOS.getQueueControlState(q.name)).toMatchObject({ queueId: q.queueId, paused: true });
     await db.pool.query('UPDATE dbos.workflow_status SET delay_until_epoch_ms = 0 WHERE workflow_uuid = $1', [
       h.workflowID,

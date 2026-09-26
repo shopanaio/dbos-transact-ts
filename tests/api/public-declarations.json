@@ -1,0 +1,337 @@
+{
+  "DBOS": {
+    "static setConfig": ["static setConfig(config: DBOSConfig): void;"],
+    "static isInitialized": ["static isInitialized(): boolean;"],
+    "static launch": ["static launch(options?: DBOSLaunchOptions): Promise<void>;"],
+    "static logRegisteredEndpoints": ["static logRegisteredEndpoints(): void;"],
+    "static shutdown": [
+      "static shutdown(options?: { deregister?: boolean; workflowCompletionTimeoutMS?: number; }): Promise<void>;"
+    ],
+    "static logger": ["static get logger(): DLogger;"],
+    "static tracer": ["static get tracer(): Tracer | undefined;"],
+    "static span": ["static get span(): DBOSSpan | undefined;"],
+    "static applicationVersion": ["static get applicationVersion(): string;"],
+    "static executorID": ["static get executorID(): string;"],
+    "static workflowQueueName": ["static get workflowQueueName(): string | undefined;"],
+    "static workflowID": ["static get workflowID(): string | undefined;"],
+    "static stepID": ["static get stepID(): number | undefined;"],
+    "static stepStatus": ["static get stepStatus(): StepStatus | undefined;"],
+    "static authenticatedUser": ["static get authenticatedUser(): string;"],
+    "static authenticatedRoles": ["static get authenticatedRoles(): string[];"],
+    "static assumedRole": ["static get assumedRole(): string;"],
+    "static isInTransaction": ["static isInTransaction(): boolean;"],
+    "static isInStep": ["static isInStep(): boolean;"],
+    "static isWithinWorkflow": ["static isWithinWorkflow(): boolean;"],
+    "static isInWorkflow": ["static isInWorkflow(): boolean;"],
+    "static getWorkflowStatus": ["static getWorkflowStatus(workflowID: string): Promise<WorkflowStatus | null>;"],
+    "static getResult": [
+      "static getResult<T>(workflowID: string, options?: number | GetResultOptions): Promise<T | null>;"
+    ],
+    "static waitFirst": [
+      "static waitFirst(handles: WorkflowHandle<unknown>[], options?: WaitFirstOptions): Promise<WorkflowHandle<unknown>>;"
+    ],
+    "static waitAll": [
+      "static waitAll<R>(handles: WorkflowHandle<R>[], options?: WaitAllOptions): Promise<WorkflowHandle<R>[]>;"
+    ],
+    "static retrieveWorkflow": [
+      "static retrieveWorkflow<T = unknown>(workflowID: string): WorkflowHandle<Awaited<T>>;"
+    ],
+    "static listWorkflows": ["static listWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatus[]>;"],
+    "static listQueuedWorkflows": ["static listQueuedWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatus[]>;"],
+    "static setWorkflowPriority": ["static setWorkflowPriority(workflowID: string, priority: number): Promise<void>;"],
+    "static setWorkflowDelay": [
+      "static setWorkflowDelay(workflowID: string, options: number | SetWorkflowDelayOptions): Promise<void>;"
+    ],
+    "static listWorkflowSteps": [
+      "static listWorkflowSteps(workflowID: string, options?: ListWorkflowStepsOptions): Promise<StepInfo[] | undefined>;"
+    ],
+    "static cancelWorkflow": [
+      "static cancelWorkflow(workflowID: string, options?: CancelWorkflowsOptions): Promise<void>;"
+    ],
+    "static cancelWorkflows": [
+      "static cancelWorkflows(workflowIDs: string[], options?: CancelWorkflowsOptions): Promise<void>;"
+    ],
+    "static resumeWorkflow": [
+      "static resumeWorkflow<T>(workflowID: string, options?: { queueName?: string; }): Promise<WorkflowHandle<Awaited<T>>>;"
+    ],
+    "static resumeWorkflows": [
+      "static resumeWorkflows<T>(workflowIDs: string[], options?: { queueName?: string; }): Promise<WorkflowHandle<Awaited<T>>[]>;"
+    ],
+    "static deleteWorkflow": ["static deleteWorkflow(workflowID: string, deleteChildren?: boolean): Promise<void>;"],
+    "static deleteWorkflows": [
+      "static deleteWorkflows(workflowIDs: string[], deleteChildren?: boolean): Promise<void>;"
+    ],
+    "static forkWorkflow": [
+      "static forkWorkflow<T>(workflowID: string, startStep: number, options?: { newWorkflowID?: string; applicationVersion?: string; timeoutMS?: number; queueName?: string; queuePartitionKey?: string; replacementChildren?: Record<string, string>; }): Promise<WorkflowHandle<Awaited<T>>>;"
+    ],
+    "static sleepms": ["static sleepms(durationMS: number): Promise<void>;"],
+    "static sleepSeconds": ["static sleepSeconds(durationSec: number): Promise<void>;"],
+    "static sleep": ["static sleep(durationMS: number): Promise<void>;"],
+    "static now": ["static now(): Promise<number>;"],
+    "static randomUUID": ["static randomUUID(): Promise<string>;"],
+    "static withNextWorkflowID": [
+      "static withNextWorkflowID<R>(workflowID: string, callback: () => Promise<R>): Promise<R>;"
+    ],
+    "static withAuthedContext": [
+      "static withAuthedContext<R>(authedUser: string, authedRoles: string[], callback: () => Promise<R>): Promise<R>;"
+    ],
+    "static withNamedContext": [
+      "static withNamedContext<R>(_callerName: string, callback: () => Promise<R>): Promise<R>;"
+    ],
+    "static withWorkflowQueue": [
+      "static withWorkflowQueue<R>(queueName: string, callback: () => Promise<R>): Promise<R>;"
+    ],
+    "static withWorkflowTimeout": [
+      "static withWorkflowTimeout<R>(timeoutMS: number | null, callback: () => Promise<R>): Promise<R>;"
+    ],
+    "static startWorkflow": [
+      "static startWorkflow<Args extends unknown[], Return>(target: (...args: Args) => Promise<Return>, params?: StartWorkflowParams): (...args: Args) => Promise<WorkflowHandle<Return>>;",
+      "static startWorkflow<T extends ConfiguredInstance>(target: T, params?: StartWorkflowParams): InvokeFunctionsAsyncInst<T>;",
+      "static startWorkflow<T extends object>(targetClass: T, params?: StartWorkflowParams): InvokeFunctionsAsync<T>;"
+    ],
+    "static send": [
+      "static send<T>(destinationID: string, message: T, topic?: string, idempotencyKey?: string, options?: SendOptions): Promise<void>;"
+    ],
+    "static recv": ["static recv<T>(topic?: string, options?: number | RecvOptions): Promise<T | null>;"],
+    "static setEvent": ["static setEvent<T>(key: string, value: T, options?: SetEventOptions): Promise<void>;"],
+    "static getEvent": [
+      "static getEvent<T>(workflowID: string, key: string, options?: number | GetEventOptions): Promise<T | null>;"
+    ],
+    "static writeStream": [
+      "static writeStream<T>(key: string, value: T, options?: WriteStreamOptions): Promise<void>;"
+    ],
+    "static closeStream": ["static closeStream(key: string): Promise<void>;"],
+    "static readStream": [
+      "static readStream<T>(workflowID: string, key: string, options?: ReadStreamOptions): AsyncGenerator<T, void, unknown>;"
+    ],
+    "static readStreamOffset": [
+      "static readStreamOffset<T>(workflowID: string, key: string, offset: number, options?: ReadStreamOffsetOptions): Promise<T>;"
+    ],
+    "static className": [
+      "static className(name: string): <T extends { new (...args: any[]): object; }>(ctor: T) => void;"
+    ],
+    "static workflow": [
+      "static workflow(config?: WorkflowConfig): <This, Args extends unknown[], Return>(target: object, propertyKey: string, inDescriptor: TypedPropertyDescriptor<(this: This, ...args: Args) => Promise<Return>>) => TypedPropertyDescriptor<(this: This, ...args: Args) => Promise<Return>>;"
+    ],
+    "static registerWorkflow": [
+      "static registerWorkflow<This, Args extends unknown[], Return>(func: (this: This, ...args: Args) => Promise<Return>, config?: FunctionName & WorkflowConfig): (this: This, ...args: Args) => Promise<Return>;"
+    ],
+    "static step": [
+      "static step(config?: StepConfig): <This, Args extends unknown[], Return>(target: object, propertyKey: string, inDescriptor: TypedPropertyDescriptor<(this: This, ...args: Args) => Promise<Return>>) => TypedPropertyDescriptor<(this: This, ...args: Args) => Promise<Return>>;"
+    ],
+    "static registerStep": [
+      "static registerStep<This, Args extends unknown[], Return>(func: (this: This, ...args: Args) => Promise<Return>, config?: StepConfig & FunctionName): (this: This, ...args: Args) => Promise<Return>;"
+    ],
+    "static runStep": [
+      "static runStep<Return>(func: () => Promise<Return>, config?: StepConfig & { name?: string; }): Promise<Return>;"
+    ],
+    "static registerSerialization": [
+      "static registerSerialization<T, S extends JSONValue>(serReg: SerializationRecipe<T, S>): void;"
+    ],
+    "static patch": ["static patch(patchName: string): Promise<boolean>;"],
+    "static deprecatePatch": ["static deprecatePatch(patchName: string): Promise<boolean>;"],
+    "static registerLifecycleCallback": ["static registerLifecycleCallback(lcl: DBOSLifecycleCallback): void;"],
+    "static associateClassWithInfo": [
+      "static associateClassWithInfo(external: AnyConstructor | object | string, cls: AnyConstructor | string): object;"
+    ],
+    "static associateFunctionWithInfo": [
+      "static associateFunctionWithInfo<This, Args extends unknown[], Return>(external: AnyConstructor | object | string, func: (this: This, ...args: Args) => Promise<Return>, target: FunctionName): { registration: MethodRegistration<This, Args, Return>; regInfo: object; };"
+    ],
+    "static getAssociatedInfo": [
+      "static getAssociatedInfo(external: AnyConstructor | object | string, cls?: object | string, funcName?: string): readonly ExternalRegistration[];"
+    ],
+    "static setAlertHandler": ["static setAlertHandler(handler: AlertHandler): void;"],
+    "static createSchedule": [
+      "static createSchedule(options: { scheduleName: string; workflowFn: ScheduledWorkflowFn; schedule: string; context?: unknown; options?: ScheduleOptions; }): Promise<void>;"
+    ],
+    "static listSchedules": [
+      "static listSchedules(filters?: { applicationName?: string | string[]; status?: string | string[]; workflowName?: string | string[]; scheduleNamePrefix?: string | string[]; }): Promise<WorkflowSchedule[]>;"
+    ],
+    "static getSchedule": ["static getSchedule(name: string): Promise<WorkflowSchedule | null>;"],
+    "static deleteSchedule": ["static deleteSchedule(name: string): Promise<void>;"],
+    "static pauseSchedule": ["static pauseSchedule(name: string): Promise<void>;"],
+    "static resumeSchedule": ["static resumeSchedule(name: string): Promise<void>;"],
+    "static updateSchedule": [
+      "static updateSchedule(name: string, updates: { schedule?: string; context?: unknown; automaticBackfill?: boolean; cronTimezone?: string | null; queueName?: string | null; }): Promise<void>;"
+    ],
+    "static applySchedules": [
+      "static applySchedules(schedules: Array<{ scheduleName: string; workflowFn: ScheduledWorkflowFn; schedule: string; context?: unknown; automaticBackfill?: boolean; cronTimezone?: string; queueName?: string; }>): Promise<void>;"
+    ],
+    "static triggerSchedule": ["static triggerSchedule(name: string): Promise<WorkflowHandle<unknown>>;"],
+    "static backfillSchedule": [
+      "static backfillSchedule(name: string, start: Date, end: Date): Promise<WorkflowHandle<unknown>[]>;"
+    ],
+    "static listApplicationVersions": ["static listApplicationVersions(): Promise<VersionInfo[]>;"],
+    "static getLatestApplicationVersion": ["static getLatestApplicationVersion(): Promise<VersionInfo>;"],
+    "static setLatestApplicationVersion": [
+      "static setLatestApplicationVersion(versionName: string, options?: { applicationName?: string; }): Promise<void>;"
+    ],
+    "static registerQueue": [
+      "static registerQueue(name: string, options?: RegisterQueueOptions): Promise<WorkflowQueue>;"
+    ],
+    "static enqueueWorkflowWithOptions": [
+      "static enqueueWorkflowWithOptions<T = unknown>(options: EnqueueWorkflowOptions, ...args: unknown[]): Promise<WorkflowHandle<T>>;"
+    ],
+    "static enqueueWorkflowWithOptionsPortable": [
+      "static enqueueWorkflowWithOptionsPortable<T = unknown>(options: EnqueueWorkflowOptions, positionalArgs: unknown[], namedArgs?: Record<string, unknown>): Promise<WorkflowHandle<T>>;"
+    ],
+    "static pauseQueue": ["static pauseQueue(name: string): Promise<import(\"./system_database\").QueueControlState>;"],
+    "static wakeQueue": ["static wakeQueue(name: string): Promise<import(\"./system_database\").QueueControlState>;"],
+    "static getQueueControlState": [
+      "static getQueueControlState(name: string): Promise<import(\"./system_database\").QueueControlState>;"
+    ],
+    "static retrieveQueue": ["static retrieveQueue(name: string): Promise<WorkflowQueue | null>;"],
+    "static deleteQueue": ["static deleteQueue(name: string): Promise<void>;"],
+    "static listQueues": ["static listQueues(applicationName?: string | string[]): Promise<WorkflowQueue[]>;"]
+  },
+  "DBOSClient": {
+    "serializer": ["readonly serializer: DBOSSerializer;"],
+    "static create": [
+      "static create({ systemDatabaseUrl, systemDatabasePool, serializer, systemDatabaseSchemaName, systemDatabasePoolSize, systemDatabasePollingConcurrency, logger, applicationName, observabilityQueryTimeoutMs, }: { systemDatabaseUrl: string; systemDatabasePool?: Pool; serializer?: DBOSSerializer; systemDatabaseSchemaName?: string; systemDatabasePoolSize?: number; systemDatabasePollingConcurrency?: number; logger?: DLogger; applicationName?: string; observabilityQueryTimeoutMs?: number; }): Promise<DBOSClient>;"
+    ],
+    "applicationName": ["get applicationName(): string | undefined;"],
+    "destroy": ["destroy(): Promise<void>;"],
+    "enqueue": [
+      "enqueue<T extends (...args: any[]) => Promise<any>>(options: ClientEnqueueOptions, ...args: Parameters<T>): Promise<WorkflowHandle<Awaited<ReturnType<T>>>>;"
+    ],
+    "enqueueDebounced": [
+      "enqueueDebounced(options: ClientEnqueueOptions, debounceDeadlineEpochMS: number | undefined, args: unknown[]): Promise<string>;"
+    ],
+    "debounceDelayedWorkflow": ["debounceDelayedWorkflow(params: DebounceParams): Promise<DebounceResult>;"],
+    "enqueuePortable": [
+      "enqueuePortable<T = unknown>(options: ClientEnqueueOptions, positionalArgs: unknown[], namedArgs?: { [key: string]: unknown; }): Promise<WorkflowHandle<T>>;"
+    ],
+    "enqueueInTransaction": [
+      "enqueueInTransaction<T extends (...args: any[]) => Promise<any>>(client: ClientBase, options: ClientEnqueueOptions, ...args: Parameters<T>): Promise<WorkflowHandle<Awaited<ReturnType<T>>>>;"
+    ],
+    "enqueuePortableInTransaction": [
+      "enqueuePortableInTransaction<T = unknown>(client: ClientBase, options: ClientEnqueueOptions, positionalArgs: unknown[], namedArgs?: { [key: string]: unknown; }): Promise<WorkflowHandle<T>>;"
+    ],
+    "registerQueue": [
+      "registerQueue(name: string, options?: RegisterQueueOptions & { applicationName?: string; }): Promise<WorkflowQueue>;"
+    ],
+    "pauseQueue": ["pauseQueue(name: string): Promise<import(\"./system_database\").QueueControlState>;"],
+    "wakeQueue": ["wakeQueue(name: string): Promise<import(\"./system_database\").QueueControlState>;"],
+    "getQueueControlState": [
+      "getQueueControlState(name: string): Promise<import(\"./system_database\").QueueControlState>;"
+    ],
+    "retrieveQueue": ["retrieveQueue(name: string): Promise<WorkflowQueue | null>;"],
+    "deleteQueue": ["deleteQueue(name: string): Promise<void>;"],
+    "listQueues": ["listQueues(applicationName?: string | string[]): Promise<WorkflowQueue[]>;"],
+    "send": [
+      "send<T>(destinationID: string, message: T, topic?: string, idempotencyKey?: string, options?: ClientSendOptions): Promise<void>;"
+    ],
+    "sendInTransaction": [
+      "sendInTransaction<T>(client: ClientBase, destinationID: string, message: T, topic?: string, idempotencyKey?: string, options?: ClientSendOptions): Promise<void>;"
+    ],
+    "getEvent": [
+      "getEvent<T>(workflowID: string, key: string, options?: number | GetEventOptions): Promise<T | null>;"
+    ],
+    "retrieveWorkflow": ["retrieveWorkflow<T = unknown>(workflowID: string): WorkflowHandle<Awaited<T>>;"],
+    "cancelWorkflow": ["cancelWorkflow(workflowID: string, options?: CancelWorkflowsOptions): Promise<void>;"],
+    "cancelWorkflows": ["cancelWorkflows(workflowIDs: string[], options?: CancelWorkflowsOptions): Promise<void>;"],
+    "resumeWorkflow": ["resumeWorkflow(workflowID: string, options?: { queueName?: string; }): Promise<void>;"],
+    "resumeWorkflows": ["resumeWorkflows(workflowIDs: string[], options?: { queueName?: string; }): Promise<void>;"],
+    "setWorkflowPriority": ["setWorkflowPriority(workflowID: string, priority: number): Promise<void>;"],
+    "setWorkflowDelay": [
+      "setWorkflowDelay(workflowID: string, options: number | SetWorkflowDelayOptions): Promise<void>;"
+    ],
+    "deleteWorkflow": ["deleteWorkflow(workflowID: string, deleteChildren?: boolean): Promise<void>;"],
+    "deleteWorkflows": ["deleteWorkflows(workflowIDs: string[], deleteChildren?: boolean): Promise<void>;"],
+    "forkWorkflow": [
+      "forkWorkflow(workflowID: string, startStep: number, options?: { newWorkflowID?: string; applicationVersion?: string; timeoutMS?: number; queueName?: string; queuePartitionKey?: string; replacementChildren?: Record<string, string>; }): Promise<string>;"
+    ],
+    "getWorkflow": ["getWorkflow(workflowID: string): Promise<WorkflowStatus | undefined>;"],
+    "listWorkflows": ["listWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatus[]>;"],
+    "listQueuedWorkflows": ["listQueuedWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatus[]>;"],
+    "listWorkflowSteps": [
+      "listWorkflowSteps(workflowID: string, options?: ListWorkflowStepsOptions): Promise<StepInfo[] | undefined>;"
+    ],
+    "waitFirst": [
+      "waitFirst(handles: WorkflowHandle<unknown>[], options?: WaitFirstOptions): Promise<WorkflowHandle<unknown>>;"
+    ],
+    "waitAll": ["waitAll<R>(handles: WorkflowHandle<R>[], options?: WaitAllOptions): Promise<WorkflowHandle<R>[]>;"],
+    "readStream": [
+      "readStream<T>(workflowID: string, key: string, options?: ReadStreamOptions): AsyncGenerator<T, void, unknown>;"
+    ],
+    "readStreamOffset": [
+      "readStreamOffset<T>(workflowID: string, key: string, offset: number, options?: ReadStreamOffsetOptions): Promise<T>;"
+    ],
+    "createSchedule": [
+      "createSchedule(options: { scheduleName: string; workflowName: string; workflowClassName?: string; schedule: string; context?: unknown; options?: ScheduleOptions; applicationName?: string; }): Promise<void>;"
+    ],
+    "listSchedules": [
+      "listSchedules(filters?: { status?: string | string[]; workflowName?: string | string[]; scheduleNamePrefix?: string | string[]; applicationName?: string | string[]; }): Promise<WorkflowSchedule[]>;"
+    ],
+    "getSchedule": ["getSchedule(name: string): Promise<WorkflowSchedule | null>;"],
+    "deleteSchedule": ["deleteSchedule(name: string): Promise<void>;"],
+    "pauseSchedule": ["pauseSchedule(name: string): Promise<void>;"],
+    "resumeSchedule": ["resumeSchedule(name: string): Promise<void>;"],
+    "updateSchedule": [
+      "updateSchedule(name: string, updates: { schedule?: string; context?: unknown; automaticBackfill?: boolean; cronTimezone?: string | null; queueName?: string | null; }): Promise<void>;"
+    ],
+    "applySchedules": [
+      "applySchedules(schedules: Array<{ scheduleName: string; workflowName: string; workflowClassName?: string; schedule: string; context?: unknown; automaticBackfill?: boolean; cronTimezone?: string; queueName?: string; applicationName?: string; }>): Promise<void>;"
+    ],
+    "triggerSchedule": ["triggerSchedule(name: string): Promise<WorkflowHandle<unknown>>;"],
+    "backfillSchedule": ["backfillSchedule(name: string, start: Date, end: Date): Promise<WorkflowHandle<unknown>[]>;"],
+    "listApplicationVersions": ["listApplicationVersions(): Promise<VersionInfo[]>;"],
+    "getLatestApplicationVersion": ["getLatestApplicationVersion(): Promise<VersionInfo>;"],
+    "setLatestApplicationVersion": [
+      "setLatestApplicationVersion(versionName: string, options?: { applicationName?: string; }): Promise<void>;"
+    ],
+    "renameApplication": [
+      "renameApplication(oldName: string | undefined, newName: string, options?: { batchSize?: number | null; adoptUnclaimedRows?: boolean; }): Promise<ApplicationRowCounts>;"
+    ]
+  },
+  "WorkflowQueue": {
+    "name": ["readonly name: string;"],
+    "queueId": ["queueId: string;"],
+    "paused": ["paused: boolean;"],
+    "pause": ["pause(): Promise<QueueControlState>;"],
+    "wake": ["wake(): Promise<QueueControlState>;"],
+    "getControlState": ["getControlState(): Promise<QueueControlState>;"],
+    "concurrency": ["concurrency?: number;"],
+    "rateLimit": ["rateLimit?: QueueRateLimit;"],
+    "workerConcurrency": ["workerConcurrency?: number;"],
+    "partitionConcurrency": ["partitionConcurrency?: number;"],
+    "partitionWorkerConcurrency": ["partitionWorkerConcurrency?: number;"],
+    "partitionRateLimit": ["partitionRateLimit?: QueueRateLimit;"],
+    "minPollingIntervalMs": ["minPollingIntervalMs?: number;"],
+    "applicationName": ["applicationName?: string;"],
+    "databaseBacked": ["readonly databaseBacked: boolean;"],
+    "clientBound": ["readonly clientBound: boolean;"],
+    "static validateQueueRegistration": [
+      "static validateQueueRegistration(name: string, params: QueueParameters): void;"
+    ],
+    "static validateQueueParams": ["static validateQueueParams(params: QueueParameters): void;"],
+    "static recordFromParams": ["static recordFromParams(name: string, params: QueueParameters): QueueRecord;"],
+    "setConcurrency": ["setConcurrency(value: number | undefined): Promise<void>;"],
+    "setGlobalConcurrency": ["setGlobalConcurrency(value: number | undefined): Promise<void>;"],
+    "setWorkerConcurrency": ["setWorkerConcurrency(value: number | undefined): Promise<void>;"],
+    "setRateLimit": ["setRateLimit(value: QueueRateLimit | undefined): Promise<void>;"],
+    "setPartitionConcurrency": ["setPartitionConcurrency(value: number | undefined): Promise<void>;"],
+    "setPartitionWorkerConcurrency": ["setPartitionWorkerConcurrency(value: number | undefined): Promise<void>;"],
+    "setPartitionRateLimit": ["setPartitionRateLimit(value: QueueRateLimit | undefined): Promise<void>;"],
+    "setMinPollingIntervalMs": ["setMinPollingIntervalMs(value: number): Promise<void>;"],
+    "getConcurrency": ["getConcurrency(): Promise<number | undefined>;"],
+    "getGlobalConcurrency": ["getGlobalConcurrency(): Promise<number | undefined>;"],
+    "getWorkerConcurrency": ["getWorkerConcurrency(): Promise<number | undefined>;"],
+    "getRateLimit": ["getRateLimit(): Promise<QueueRateLimit | undefined>;"],
+    "getPartitionConcurrency": ["getPartitionConcurrency(): Promise<number | undefined>;"],
+    "getPartitionWorkerConcurrency": ["getPartitionWorkerConcurrency(): Promise<number | undefined>;"],
+    "getPartitionRateLimit": ["getPartitionRateLimit(): Promise<QueueRateLimit | undefined>;"],
+    "getMinPollingIntervalMs": ["getMinPollingIntervalMs(): Promise<number | undefined>;"]
+  },
+  "Debouncer": {
+    "debounce": [
+      "debounce(debounceKey: string, debouncePeriodMs: number, ...args: Args): Promise<WorkflowHandle<Return>>;"
+    ]
+  },
+  "DebouncerClient": {
+    "client": ["readonly client: DBOSClient;"],
+    "debounce": [
+      "debounce(debounceKey: string, debouncePeriodMs: number, ...args: unknown[]): Promise<WorkflowHandle<unknown>>;"
+    ]
+  }
+}

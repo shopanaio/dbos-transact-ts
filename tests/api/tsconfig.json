@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.shared.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "skipLibCheck": true
+  },
+  "include": ["consumer.ts"]
+}

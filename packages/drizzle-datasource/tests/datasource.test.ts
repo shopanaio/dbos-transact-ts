@@ -1,3 +1,4 @@
+import { withTestSystemDatabase } from '../../../tests/system-database-factory';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { Client, Pool, PoolConfig } from 'pg';
 import { DrizzleDataSource } from '..';
@@ -41,7 +42,7 @@ describe('DrizzleDataSource', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'drizzle-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'drizzle-ds-test' }));
     await DBOS.launch();
   });
 
@@ -565,7 +566,7 @@ describe('DrizzleDataSourceCreateTxC', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'drizzle-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'drizzle-ds-test' }));
     await DBOS.launch();
   });
 

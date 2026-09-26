@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { GetWorkflowsInput, StatusString, DBOS, DBOSClient } from '../src';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
 import {
@@ -13,7 +14,7 @@ import { Client, Pool, PoolClient } from 'pg';
 import { WorkflowHandle, WorkflowStatus } from '../src/workflow';
 import { randomUUID } from 'node:crypto';
 import { globalParams, sleepms } from '../src/utils';
-import { retentionLockKey, SystemDatabase } from '../src/system_database';
+import { retentionLockKey, PostgresSystemDatabase } from '../src/system_database';
 import { GlobalLogger } from '../src/telemetry/logs';
 import {
   garbageCollect,
@@ -250,14 +251,14 @@ describe('workflow-management-tests', () => {
     expect(workflows[1].workflowID).toBe(workflowIDs[7]);
   });
 
-  test('getworkflows-cli', async () => {
+  test('[postgres-only] getworkflows-cli', async () => {
     await expect(TestEndpoints.testWorkflow('alice')).resolves.toBe('alice');
 
     await expect(TestEndpoints.failWorkflow('alice')).rejects.toThrow();
 
     const logger = new GlobalLogger();
     expect(config.systemDatabaseUrl).toBeDefined();
-    const sysdb = new SystemDatabase(config.systemDatabaseUrl!, logger, DBOSJSON);
+    const sysdb = new PostgresSystemDatabase(config.systemDatabaseUrl!, logger, DBOSJSON);
     try {
       const input: GetWorkflowsInput = {};
       const infos = await listWorkflows(sysdb, input);
@@ -344,13 +345,13 @@ describe('workflow-management-tests', () => {
     expect(rows[0].status).toBe(StatusString.SUCCESS);
   });
 
-  test('test-cancel-retry-restart', async () => {
+  test('[postgres-only] test-cancel-retry-restart', async () => {
     TestEndpoints.tries = 0;
 
     // A blocked workflow observes cancellation on its next poll, not instantly. Shorten the
     // poll interval so the cancelled recv below stops promptly (the launch in beforeEach builds
     // a fresh system database, so this does not leak to other tests).
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     sysdb.dbPollingIntervalEventMs = 100;
 
     const workflowID = `test-cancel-resume-fork-${Date.now()}`;
@@ -455,14 +456,14 @@ describe('workflow-management-tests', () => {
     TestEndpoints.staleWriteSecondRunDone.clear();
 
     const wfid = randomUUID();
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     const parked = new Event();
     const releaseStaleWrite = new Event();
     let parkedOnce = false;
 
     const originalRecordOutput = sysdb.recordWorkflowOutput.bind(sysdb);
-    sysdb.recordWorkflowOutput = async (...fnargs: Parameters<SystemDatabase['recordWorkflowOutput']>) => {
+    sysdb.recordWorkflowOutput = async (...fnargs: Parameters<PostgresSystemDatabase['recordWorkflowOutput']>) => {
       if (fnargs[0] === wfid && !parkedOnce) {
         parkedOnce = true;
         parked.set();
@@ -712,7 +713,7 @@ describe('test-list-queues', () => {
     }
   }
 
-  test('test-list-queues', async () => {
+  test('[postgres-only] test-list-queues', async () => {
     const wfid = randomUUID();
 
     // Start the workflow. Wait for all five tasks to start. Verify that they started.
@@ -723,7 +724,7 @@ describe('test-list-queues', () => {
 
     const logger = new GlobalLogger();
     expect(config.systemDatabaseUrl).toBeDefined();
-    const sysdb = new SystemDatabase(config.systemDatabaseUrl!, logger, DBOSJSON);
+    const sysdb = new PostgresSystemDatabase(config.systemDatabaseUrl!, logger, DBOSJSON);
     try {
       let input: GetWorkflowsInput = {};
       let output: WorkflowStatus[] = [];
@@ -917,14 +918,17 @@ describe('test-list-queues', () => {
     }
 
     // Garbage collect all but one workflow
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(undefined, 1);
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(undefined, 1);
     // Verify two workflows remain: the newest and blocked workflow
     let workflows = await DBOS.listWorkflows({});
     expect(workflows.length).toBe(2);
     expect(workflows[0].workflowID).toEqual(handle.workflowID);
 
     // Garbage collect all completed workflows
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(cutoffPastAllCompletions(), undefined);
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(
+      cutoffPastAllCompletions(),
+      undefined,
+    );
     // Verify only the blocked workflow remains
     workflows = await DBOS.listWorkflows({});
     expect(workflows.length).toBe(1);
@@ -933,12 +937,15 @@ describe('test-list-queues', () => {
     // Finish the blocked workflow, garbage collect everything
     TestGarbageCollection.event.set();
     await expect(handle.getResult()).resolves.toBeTruthy();
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(cutoffPastAllCompletions(), undefined);
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(
+      cutoffPastAllCompletions(),
+      undefined,
+    );
     workflows = await DBOS.listWorkflows({});
     expect(workflows.length).toBe(0);
 
     // Verify GC runs without errors on a blank table
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(undefined, 1);
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(undefined, 1);
 
     // Run workflows, wait, run them again
     for (let i = 0; i < numWorkflows; i++) {
@@ -949,7 +956,10 @@ describe('test-list-queues', () => {
       await expect(TestGarbageCollection.testWorkflow(i)).resolves.toBe(i);
     }
     // GC the first half, verify only half were GC'ed
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(Date.now() - 1000, undefined);
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(
+      Date.now() - 1000,
+      undefined,
+    );
     workflows = await DBOS.listWorkflows({});
     expect(workflows.length).toBe(numWorkflows);
 
@@ -962,7 +972,10 @@ describe('test-list-queues', () => {
       enqueueOptions: { delaySeconds: 60 },
     }).gcQueuedWorkflow();
     expect((await delayedHandle.getStatus())?.status).toBe(StatusString.DELAYED);
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(cutoffPastAllCompletions(), undefined);
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(
+      cutoffPastAllCompletions(),
+      undefined,
+    );
     const gcWorkflows = await DBOS.listWorkflows({});
     const gcWfIds = new Set(gcWorkflows.map((w) => w.workflowID));
     expect(gcWfIds.has(enqueuedHandle.workflowID)).toBe(true);
@@ -973,9 +986,14 @@ describe('test-list-queues', () => {
     await DBOS.cancelWorkflow(delayedHandle.workflowID);
 
     // Conductor sends a disabled threshold as JSON null, not undefined
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(cutoffPastAllCompletions(), null);
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(null, 1);
-    await expect(DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(null, null)).resolves.toBeUndefined();
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(
+      cutoffPastAllCompletions(),
+      null,
+    );
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(null, 1);
+    await expect(
+      (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(null, null),
+    ).resolves.toBeUndefined();
 
     // With both supplied the more restrictive cutoff wins, and the round reports the one it
     // used: the payload sweep runs against that same bound.
@@ -984,21 +1002,28 @@ describe('test-list-queues', () => {
       await sleepms(5);
     }
     const explicit = Date.now();
-    const rowsCutoff = await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(0, 1);
+    const rowsCutoff = await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(
+      0,
+      1,
+    );
     expect(rowsCutoff).toBeGreaterThan(0);
     expect(rowsCutoff).toBeLessThanOrEqual(explicit);
     await expect(DBOS.listWorkflows({})).resolves.toHaveLength(1);
-    await expect(DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(explicit, undefined)).resolves.toBe(
-      explicit,
-    );
+    await expect(
+      (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(explicit, undefined),
+    ).resolves.toBe(explicit);
 
     // Conductor sends a cleared batch size as JSON null, which takes the default
     for (let i = 0; i < numWorkflows; i++) {
       await expect(TestGarbageCollection.testWorkflow(i)).resolves.toBe(i);
     }
-    await DBOSExecutor.globalInstance!.systemDatabase.garbageCollect(cutoffPastAllCompletions(), undefined, {
-      batchSize: null,
-    });
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(
+      cutoffPastAllCompletions(),
+      undefined,
+      {
+        batchSize: null,
+      },
+    );
     await expect(DBOS.listWorkflows({})).resolves.toHaveLength(0);
   });
 
@@ -1047,7 +1072,7 @@ describe('test-list-queues', () => {
 
   // 3 = short final batch, 5 = exact multiple, 20 = larger than all eligible rows
   test.each([3, 5, 20])('test-garbage-collection-batched (batchSize=%i)', async (batchSize) => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // Earlier tests in this describe share the database, so start from an empty table.
     await sysdb.garbageCollect(cutoffPastAllCompletions(), undefined, { batchSize: null });
 
@@ -1094,8 +1119,8 @@ describe('test-list-queues', () => {
     await expect(DBOS.listWorkflows({})).resolves.toHaveLength(0);
   });
 
-  test('test-garbage-collection-batched-rows-threshold', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+  test('[postgres-only] test-garbage-collection-batched-rows-threshold', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await sysdb.garbageCollect(cutoffPastAllCompletions(), undefined, { batchSize: null });
 
     const numWorkflows = 10;
@@ -1145,8 +1170,8 @@ describe('test-list-queues', () => {
     await sysdb.garbageCollect(cutoffPastAllCompletions(), undefined, { batchSize: 3 });
   });
 
-  test('test-garbage-collection-collects-rows-that-terminalize-mid-sweep', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+  test('[postgres-only] test-garbage-collection-collects-rows-that-terminalize-mid-sweep', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await sysdb.garbageCollect(cutoffPastAllCompletions(), undefined);
 
     // A row that terminalizes mid-pass takes completed_at > cutoff and cannot fall below the
@@ -1190,8 +1215,8 @@ describe('test-list-queues', () => {
     expect(rows).toHaveLength(0);
   });
 
-  test('test-garbage-collection-batched-resumable', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+  test('[postgres-only] test-garbage-collection-batched-resumable', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await sysdb.garbageCollect(cutoffPastAllCompletions(), undefined, { batchSize: null });
 
     const numWorkflows = 10;
@@ -1223,8 +1248,8 @@ describe('test-list-queues', () => {
     await expect(DBOS.listWorkflows({})).resolves.toHaveLength(0);
   });
 
-  test('test-garbage-collection-retries-serialization-errors', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+  test('[postgres-only] test-garbage-collection-retries-serialization-errors', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await sysdb.garbageCollect(cutoffPastAllCompletions(), undefined, { batchSize: null });
 
     const numWorkflows = 6;
@@ -1286,7 +1311,7 @@ describe('test-list-queues', () => {
   });
 
   test('test-garbage-collection-batch-size-validation', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     for (const batchSize of [0, -1, 1.5, NaN]) {
       // Both sweeps take a batch size, so both have to reject a nonsensical one before it
       // reaches SQL and leaves a round half-applied.
@@ -1342,12 +1367,12 @@ describe('test-list-queues', () => {
     );
   }
 
-  test('test-destroy-cuts-a-running-retention-round', async () => {
+  test('[postgres-only] test-destroy-cuts-a-running-retention-round', async () => {
     // A round holds the advisory lock for its whole duration and a connection for each
     // statement in flight. Closing the pool would wait on both, so destroy() cuts them first.
     await expect(TestGarbageCollection.testWorkflow(1)).resolves.toBe(1);
 
-    const sysdb = new SystemDatabase(config.systemDatabaseUrl!, new GlobalLogger(), DBOSJSON);
+    const sysdb = new PostgresSystemDatabase(config.systemDatabaseUrl!, new GlobalLogger(), DBOSJSON);
     const key = retentionLockKey(sysdb.schemaName).toString();
     const lockHeld = async () => {
       const { rows } = await systemDBClient.query<{ classid: string; objid: string; objsubid: number }>(
@@ -1393,12 +1418,12 @@ describe('test-list-queues', () => {
     }
   });
 
-  test('test-destroy-stops-retention-on-a-pool-it-does-not-own', async () => {
+  test('[postgres-only] test-destroy-stops-retention-on-a-pool-it-does-not-own', async () => {
     // destroy() never closes a user-supplied pool, so the pool would not refuse a cut round's
     // next borrow. The system database has to refuse it itself, or the round sweeps on
     // without its lock against a database we have left.
     const pool = new Pool({ connectionString: config.systemDatabaseUrl });
-    const sysdb = new SystemDatabase(config.systemDatabaseUrl!, new GlobalLogger(), DBOSJSON, undefined, pool);
+    const sysdb = new PostgresSystemDatabase(config.systemDatabaseUrl!, new GlobalLogger(), DBOSJSON, undefined, pool);
     try {
       // Live before destroy, so the refusal below is destroy's doing.
       const lock = await sysdb.acquireRetentionLock();
@@ -1416,7 +1441,7 @@ describe('test-list-queues', () => {
   });
 
   test('test-payload-garbage-collection', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // Earlier tests in this describe share the database, so start from an empty table.
     await garbageCollect(sysdb, cutoffPastAllCompletions());
 
@@ -1463,8 +1488,8 @@ describe('test-list-queues', () => {
     await expect(forked.getResult()).resolves.toBe(expected);
   });
 
-  test('test-retention-lock-serializes-rounds', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+  test('[postgres-only] test-retention-lock-serializes-rounds', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await garbageCollect(sysdb, cutoffPastAllCompletions());
 
     const key = retentionLockKey(sysdb.schemaName).toString();
@@ -1538,7 +1563,7 @@ describe('test-list-queues', () => {
   });
 
   test('test-garbage-collection-spans-every-application', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await garbageCollect(sysdb, cutoffPastAllCompletions());
 
     await expect(TestGarbageCollection.testWorkflow(1)).resolves.toBe(1);
@@ -1565,7 +1590,7 @@ describe('test-list-queues', () => {
   });
 
   test('test-payload-gc-spares-a-straggler-then-reclaims-it', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await garbageCollect(sysdb, cutoffPastAllCompletions());
 
     // A workflow older than the cutoff that still has a status row keeps its payload across
@@ -1599,7 +1624,7 @@ describe('test-list-queues', () => {
   });
 
   test('test-payload-gc-never-orphans-a-status-row', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await garbageCollect(sysdb, cutoffPastAllCompletions());
 
     // Across a mixed population and repeated sweeps, no surviving status row ever loses the
@@ -1638,8 +1663,8 @@ describe('test-list-queues', () => {
     expect(await orphanedStatusRows(systemDBClient)).toEqual([0, 0]);
   });
 
-  test('test-payload-gc-batches-by-watermark', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+  test('[postgres-only] test-payload-gc-batches-by-watermark', async () => {
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await garbageCollect(sysdb, cutoffPastAllCompletions());
 
     const numWorkflows = 7;
@@ -1695,7 +1720,7 @@ describe('test-list-queues', () => {
     // Wait one second, start one final workflow, then timeout all workflows started more than one second ago
     await sleepms(1000);
     const finalHandle = await DBOS.startWorkflow(TestGlobalTimeout).blockedWorkflow();
-    await globalTimeout(DBOSExecutor.globalInstance?.systemDatabase as SystemDatabase, Date.now() - 1000);
+    await globalTimeout(DBOSExecutor.globalInstance?.systemDatabase as PostgresSystemDatabase, Date.now() - 1000);
 
     // Verify all workflows started before the global timeout are cancelled
     for (const handle of handles) {
@@ -1735,7 +1760,7 @@ describe('legacy-payload-rows', () => {
   });
 
   test('test-legacy-payload-rows-still-read', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     await expect(LegacyPayload.workflow(11)).resolves.toBe(11);
     const workflowID = (await DBOS.listWorkflows({}))[0].workflowID;
@@ -2283,7 +2308,7 @@ describe('test-list-steps', () => {
     }
   });
 
-  test('test-child-rerun', async () => {
+  test('[postgres-only] test-child-rerun', async () => {
     const wfid = randomUUID();
     let handle = await DBOS.startWorkflow(TestListSteps, { workflowID: wfid }).CounterParent();
     const result1 = await handle.getResult();
@@ -2293,7 +2318,7 @@ describe('test-list-steps', () => {
     expect(result1).toEqual(result2);
 
     expect(config.systemDatabaseUrl).toBeDefined();
-    const sysdb = new SystemDatabase(config.systemDatabaseUrl!, new GlobalLogger(), DBOSJSON);
+    const sysdb = new PostgresSystemDatabase(config.systemDatabaseUrl!, new GlobalLogger(), DBOSJSON);
     try {
       const wfs = await listWorkflows(sysdb, {});
       expect(wfs.length).toBe(2);
@@ -2627,7 +2652,7 @@ describe('test-fork', () => {
     expect(ExampleWorkflow.stepTwoCount).toBe(3);
     expect(ExampleWorkflow.stepThreeCount).toBe(2);
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // fromLastFailure: wf1 from failed step 1, wf2 from failed step 2, wf3 from last step 2 (fallback)
     const forkedIDs = await sysdb.forkFromFailure([wf1Id, wf2Id, wf3Id], { fromLastFailure: true });
@@ -3443,7 +3468,7 @@ describe('wf-cancel-tests', () => {
     const result = await handle.getResult();
     expect(result).toBe(workflowId);
 
-    const sysDb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysDb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // Capture the original status so we can confirm a faithful round-trip of every
     // persisted status field (not just the input/output/steps).
@@ -3655,7 +3680,9 @@ describe('wf-cancel-tests', () => {
     }
 
     // The cascade should discover the full descendant tree
-    const children = await DBOSExecutor.globalInstance!.systemDatabase.getWorkflowChildren(parentID);
+    const children = await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).getWorkflowChildren(
+      parentID,
+    );
     expect(new Set(children)).toEqual(new Set([childID, grandchildID]));
 
     // Cancelling without cancelChildren only affects the parent
@@ -3771,7 +3798,9 @@ describe('wf-cancel-tests', () => {
   });
 
   test('test-client-delete-workflows', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       // Single delete
       const wfid1 = randomUUID();
@@ -3817,7 +3846,7 @@ describe('wf-cancel-tests', () => {
     const handle = await DBOS.startWorkflow(EventsTest).eventWorkflow();
     const wfid = await handle.getResult();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const events = await sysdb.getAllEvents(wfid);
     expect(events).toEqual({ key1: 'updated', key2: 42 });
 
@@ -3851,7 +3880,7 @@ describe('wf-cancel-tests', () => {
     // Send a third notification that won't be consumed
     await DBOS.send(wfid, 'unconsumed', 'topic_c');
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const notifications = await sysdb.getAllNotifications(wfid);
     expect(notifications.length).toBe(3);
     expect(notifications[0].topic).toBe('topic_a');
@@ -3888,7 +3917,7 @@ describe('wf-cancel-tests', () => {
     await NullTopicTest.recvEvent.wait();
     await handle.getResult();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const notifications = await sysdb.getAllNotifications(wfid);
     expect(notifications.length).toBe(1);
     expect(notifications[0].topic).toBeNull();
@@ -3911,7 +3940,7 @@ describe('wf-cancel-tests', () => {
     const handle = await DBOS.startWorkflow(StreamsTest).streamWorkflow();
     const wfid = await handle.getResult();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const streams = await sysdb.getAllStreamEntries(wfid);
     expect(streams).toEqual({ stream_a: [10, 20], stream_b: ['hello'] });
 
@@ -3989,7 +4018,7 @@ describe('test-workflow-aggregates', () => {
     for (let i = 0; i < 3; i++) await AggWorkflows.successWorkflow();
     for (let i = 0; i < 2; i++) await expect(AggWorkflows.failWorkflow()).rejects.toThrow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({ groupByStatus: true, selectCount: true });
     const map = toMap(results);
     expect(map['SUCCESS']).toBe(3);
@@ -4000,7 +4029,7 @@ describe('test-workflow-aggregates', () => {
     for (let i = 0; i < 3; i++) await AggWorkflows.successWorkflow();
     for (let i = 0; i < 2; i++) await expect(AggWorkflows.failWorkflow()).rejects.toThrow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({ groupByName: true, selectCount: true });
     const nameMap: Record<string, number> = {};
     for (const r of results) {
@@ -4016,7 +4045,7 @@ describe('test-workflow-aggregates', () => {
     for (let i = 0; i < 3; i++) await AggWorkflows.successWorkflow();
     for (let i = 0; i < 2; i++) await expect(AggWorkflows.failWorkflow()).rejects.toThrow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({
       groupByStatus: true,
       groupByName: true,
@@ -4043,7 +4072,7 @@ describe('test-workflow-aggregates', () => {
   test('group-by-application-version', async () => {
     await AggWorkflows.successWorkflow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({ groupByApplicationVersion: true, selectCount: true });
     expect(results.length).toBeGreaterThanOrEqual(1);
     const row = results.find((r) => r.group['application_version'] === 'v0');
@@ -4054,7 +4083,7 @@ describe('test-workflow-aggregates', () => {
   test('group-by-executor-id', async () => {
     await AggWorkflows.successWorkflow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({ groupByExecutorId: true, selectCount: true });
     expect(results.length).toBeGreaterThanOrEqual(1);
     for (const r of results) {
@@ -4069,7 +4098,7 @@ describe('test-workflow-aggregates', () => {
     await handle.getResult();
     await AggWorkflows.successWorkflow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({ groupByQueueName: true, selectCount: true });
     const map: Record<string, number> = {};
     for (const r of results) {
@@ -4083,7 +4112,7 @@ describe('test-workflow-aggregates', () => {
     for (let i = 0; i < 2; i++) await AggWorkflows.successWorkflow();
     await expect(AggWorkflows.failWorkflow()).rejects.toThrow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({
       groupByStatus: true,
       groupByName: true,
@@ -4107,7 +4136,7 @@ describe('test-workflow-aggregates', () => {
     for (let i = 0; i < 3; i++) await AggWorkflows.successWorkflow();
     for (let i = 0; i < 2; i++) await expect(AggWorkflows.failWorkflow()).rejects.toThrow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({
       groupByName: true,
       status: ['SUCCESS'],
@@ -4121,7 +4150,7 @@ describe('test-workflow-aggregates', () => {
     for (let i = 0; i < 3; i++) await AggWorkflows.successWorkflow();
     for (let i = 0; i < 2; i++) await expect(AggWorkflows.failWorkflow()).rejects.toThrow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // First find the registered fail name
     const all = await sysdb.getWorkflowAggregates({ groupByName: true, selectCount: true });
     const failName = all.find((r) => r.group['name']!.includes('failWorkflow'))!.group['name']!;
@@ -4140,7 +4169,7 @@ describe('test-workflow-aggregates', () => {
     for (let i = 0; i < 3; i++) await AggWorkflows.successWorkflow();
     for (let i = 0; i < 2; i++) await expect(AggWorkflows.failWorkflow()).rejects.toThrow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({
       groupByStatus: true,
       status: ['SUCCESS', 'ERROR'],
@@ -4154,7 +4183,7 @@ describe('test-workflow-aggregates', () => {
   test('filter-by-app-version', async () => {
     for (let i = 0; i < 2; i++) await AggWorkflows.successWorkflow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({
       groupByName: true,
       appVersion: ['v0'],
@@ -4176,7 +4205,7 @@ describe('test-workflow-aggregates', () => {
     await AggWorkflows.successWorkflow();
     const afterTime = new Date().toISOString();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // Within range
     const results = await sysdb.getWorkflowAggregates({
@@ -4202,7 +4231,7 @@ describe('test-workflow-aggregates', () => {
     for (let i = 0; i < 4; i++) await AggWorkflows.successWorkflow();
     for (let i = 0; i < 3; i++) await expect(AggWorkflows.failWorkflow()).rejects.toThrow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // Group by status + version, filtered to SUCCESS only
     const results = await sysdb.getWorkflowAggregates({
@@ -4229,7 +4258,7 @@ describe('test-workflow-aggregates', () => {
       await AggWorkflows.successWorkflow();
     }
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // Filter to only the prefixed workflows
     const results = await sysdb.getWorkflowAggregates({
@@ -4265,14 +4294,14 @@ describe('test-workflow-aggregates', () => {
   });
 
   test('no-group-by-flags-throws', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await expect(sysdb.getWorkflowAggregates({ selectCount: true })).rejects.toThrow(
       'At least one group_by flag must be set',
     );
   });
 
   test('no-select-flags-throws', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await expect(sysdb.getWorkflowAggregates({ groupByStatus: true })).rejects.toThrow(
       'At least one select_ flag must be set',
     );
@@ -4282,7 +4311,7 @@ describe('test-workflow-aggregates', () => {
     for (let i = 0; i < 3; i++) await AggWorkflows.successWorkflow();
     for (let i = 0; i < 2; i++) await expect(AggWorkflows.failWorkflow()).rejects.toThrow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // time_bucket_size_ms alone (1-hour buckets = 3_600_000 ms)
     const oneHourMs = 3_600_000;
@@ -4330,13 +4359,13 @@ describe('test-workflow-aggregates', () => {
 
   test('empty-results', async () => {
     // No workflows run — aggregates should return empty
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const results = await sysdb.getWorkflowAggregates({ groupByStatus: true, selectCount: true });
     expect(results.length).toBe(0);
   });
 
   test('filter-by-completed-and-dequeued', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const beforeAll = new Date().toISOString();
     await sleepms(50);
 
@@ -4395,7 +4424,7 @@ describe('test-workflow-aggregates', () => {
   });
 
   test('select-min-created-at', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // Three successWorkflow runs with a small gap so min(created_at) is unambiguous,
     // then one queuedWorkflow.
@@ -4469,7 +4498,7 @@ describe('test-workflow-aggregates', () => {
   });
 
   test('select-max-durations', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // Two sync workflows: started_at_epoch_ms is NULL, so they are excluded
     // from max_queue_wait_ms but included in max_total_latency_ms.
@@ -4540,7 +4569,7 @@ describe('test-workflow-aggregates', () => {
       await handle.getResult();
     }
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // Filter to two of the three IDs
     const results = await sysdb.getWorkflowAggregates({
@@ -4571,7 +4600,7 @@ describe('test-workflow-aggregates', () => {
       await AggWorkflows.successWorkflow();
     });
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     const alice = await sysdb.getWorkflowAggregates({
       groupByStatus: true,
@@ -4614,7 +4643,7 @@ describe('test-workflow-aggregates', () => {
     await (await DBOS.forkWorkflow(origId, 0)).getResult();
     await (await DBOS.forkWorkflow(origId, 0)).getResult();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // forkedFrom: the two forks were forked from origId
     const forks = await sysdb.getWorkflowAggregates({
@@ -4657,7 +4686,7 @@ describe('test-workflow-aggregates', () => {
     const handle = await DBOS.startWorkflow(AggWorkflows, { workflowID: parentId }).parentWorkflow();
     await handle.getResult();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // parentWorkflowID: the child has parent_workflow_id = parentId
     const children = await sysdb.getWorkflowAggregates({
@@ -4708,7 +4737,7 @@ describe('test-workflow-aggregates', () => {
     }).successWorkflow();
     await h.getResult();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // Containment match on a single key
     const acme = await sysdb.getWorkflowAggregates({
@@ -4736,7 +4765,7 @@ describe('test-workflow-aggregates', () => {
     expect(empty.length).toBe(0);
   });
 
-  test('filter-by-schedule-name', async () => {
+  test('[postgres-only] filter-by-schedule-name', async () => {
     // schedule_name is only populated by the persistent scheduler; set it directly
     // on completed workflows to exercise the aggregate filter deterministically.
     const ids: string[] = [];
@@ -4747,7 +4776,7 @@ describe('test-workflow-aggregates', () => {
       ids.push(id);
     }
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     const client = new Client({ connectionString: config.systemDatabaseUrl });
     await client.connect();
@@ -4879,7 +4908,7 @@ describe('test-step-aggregates', () => {
     // 2 wfFail runs → 2 stepFail rows with error set.
     for (let i = 0; i < 2; i++) await expect(StepAggWorkflows.wfFail()).rejects.toThrow();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // Group by function_name + selectCount
     let results = await sysdb.getStepAggregates({ groupByFunctionName: true, selectCount: true });
@@ -4977,7 +5006,7 @@ describe('test-step-aggregates', () => {
     await DurationWorkflows.parent();
     const afterAll = new Date().toISOString();
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     // completedAfter/completedBefore plus the two real step durations.
     let results = await sysdb.getStepAggregates({

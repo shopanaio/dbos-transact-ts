@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { Client } from 'pg';
 import { ConfiguredInstance, DBOS, DBOSClient, WorkflowHandle } from '../src/';
 import { DBOSConflictingRegistrationError } from '../src/error';
@@ -271,7 +272,9 @@ describe('decorator-free-tests', () => {
 
   test('wf-free-step-reg-client', async () => {
     expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       const handle = await client.enqueue<typeof regWFRegStep>(
         {
@@ -384,7 +387,9 @@ describe('decorator-free-tests', () => {
 
   test('wf-static-step-reg-client', async () => {
     expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       const handle = await client.enqueue<typeof TestClass.wfRunStepStatic>(
         {
@@ -496,7 +501,9 @@ describe('decorator-free-tests', () => {
 
   test('wf-inst-step-reg-client', async () => {
     expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       const handle = await client.enqueue<typeof TestClass.prototype.wfRegStep>(
         {

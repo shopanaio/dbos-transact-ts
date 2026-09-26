@@ -1,3 +1,5 @@
+import { PostgresSystemDatabase } from '../src/system_database';
+import { withTestClientDatabase } from './system-database-factory';
 // This test covers various system DB settings for the Postgres version
 //  Basically, will it function without notifications, by falling back to polling?
 //  Does the notification work if polling is so slow as to be discounted?
@@ -82,7 +84,7 @@ class PGSDBTests {
   }
 }
 
-const sysDB = () => DBOSExecutor.globalInstance!.systemDatabase;
+const sysDB = () => DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
 async function doTheNonWFTimeoutTest() {
   let ct = Date.now();
@@ -237,7 +239,7 @@ describe('queued-wf-tests-simple', () => {
   });
 
   // Test functions - notification variant
-  test('run-sysdb-nopoller', async () => {
+  test('[postgres-only] run-sysdb-nopoller', async () => {
     const prev = sysDB().dbPollingIntervalResultMs;
     //sysDB().dbPollingIntervalMs = 1000000;
     //The intent was that this would check the notifier.
@@ -258,7 +260,7 @@ describe('queued-wf-tests-simple', () => {
   });
 
   // Test functions - poller variant
-  test('run-sysdb-onlypoller', async () => {
+  test('[postgres-only] run-sysdb-onlypoller', async () => {
     const prev = sysDB().dbPollingIntervalResultMs;
     sysDB().dbPollingIntervalResultMs = 100;
     sysDB().dbPollingIntervalEventMs = 100;
@@ -293,7 +295,7 @@ describe('sysdb-no-listen-notify', () => {
     await DBOS.shutdown();
   });
 
-  test('polling-without-listen-notify', async () => {
+  test('[postgres-only] polling-without-listen-notify', async () => {
     expect(sysDB().shouldUseDBNotifications).toBe(false);
     sysDB().dbPollingIntervalResultMs = 100;
     sysDB().dbPollingIntervalEventMs = 100;
@@ -309,7 +311,7 @@ describe('sysdb-no-listen-notify', () => {
     await doTheWFCancelTest();
   });
 
-  test('wait-all-without-listen-notify', async () => {
+  test('[postgres-only] wait-all-without-listen-notify', async () => {
     expect(sysDB().shouldUseDBNotifications).toBe(false);
     const previousResultInterval = sysDB().dbPollingIntervalResultMs;
     sysDB().dbPollingIntervalResultMs = 100;
@@ -343,7 +345,7 @@ describe('sysdb-no-listen-notify', () => {
     }
   });
 
-  test('per-call-polling-interval-options', async () => {
+  test('[postgres-only] per-call-polling-interval-options', async () => {
     expect(sysDB().shouldUseDBNotifications).toBe(false);
     const previousResultInterval = sysDB().dbPollingIntervalResultMs;
     const previousEventInterval = sysDB().dbPollingIntervalEventMs;
@@ -453,7 +455,9 @@ describe('sysdb-no-listen-notify', () => {
       assertQuick(ct);
       await workflowGetEventSetter.getResult({ pollingIntervalMs: 50 });
 
-      const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+      const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+        DBOSClient.create(options),
+      );
       try {
         ct = Date.now();
         const clientResultWorkflowID = randomUUID();
@@ -511,7 +515,9 @@ describe('sysdb-no-listen-notify', () => {
 
   test('invalid-polling-interval-options', async () => {
     const invalidIntervals = [0, -1, Number.NaN, Number.POSITIVE_INFINITY];
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       for (const pollingIntervalMs of invalidIntervals) {
         await expect(DBOS.getResult(randomUUID(), { timeoutSeconds: 0, pollingIntervalMs })).rejects.toThrow(
@@ -596,7 +602,7 @@ describe('sysdb-notifications-lifecycle', () => {
     await DBOS.shutdown();
   });
 
-  test('late-client-error-after-shutdown', async () => {
+  test('[postgres-only] late-client-error-after-shutdown', async () => {
     await DBOS.launch();
     const systemDatabase = sysDB();
     const client = systemDatabase.notificationsClient;
@@ -613,7 +619,7 @@ describe('sysdb-notifications-lifecycle', () => {
     expect(systemDatabase.reconnectTimeout).toBeNull();
   });
 
-  test('reconnects-after-error-but-not-after-shutdown', async () => {
+  test('[postgres-only] reconnects-after-error-but-not-after-shutdown', async () => {
     await DBOS.launch();
     const systemDatabase = sysDB();
     const client = systemDatabase.notificationsClient;
@@ -640,7 +646,7 @@ describe('sysdb-notifications-lifecycle', () => {
     expect(systemDatabase.reconnectTimeout).toBeNull();
   });
 
-  test('late-client-error-after-shutdown-on-a-caller-pool', async () => {
+  test('[postgres-only] late-client-error-after-shutdown-on-a-caller-pool', async () => {
     // The caller-pool twin of the test above. Shutdown releases the notifications client back to a pool
     // DBOS never gave an 'error' listener, so a late teardown error has to die on the client.
     const pool = new Pool({ connectionString: config.systemDatabaseUrl });
@@ -686,10 +692,10 @@ describe('sysdb-notifications-lifecycle', () => {
 
     try {
       await killer.connect();
-      const client = await DBOSClient.create({
+      const client = await withTestClientDatabase({
         systemDatabaseUrl: config.systemDatabaseUrl!,
         systemDatabasePool: pool,
-      });
+      }).then((options) => DBOSClient.create(options));
       const queueName = `borrowed-client-queue-${appName}`;
       try {
         await client.registerQueue(queueName);

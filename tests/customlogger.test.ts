@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { randomUUID } from 'node:crypto';
 import { ContextualMetadata, DBOS, DBOSClient, DLogger, StackTrace } from '../src';
 import { generateDBOSTestConfig, setUpDBOSTestSysDb } from './helpers';
@@ -202,7 +203,10 @@ describe('custom-logger', () => {
 
   test('DBOSClient logs through an injected logger', async () => {
     const config = generateDBOSTestConfig();
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl!, logger: recorder });
+    const client = await withTestClientDatabase({
+      systemDatabaseUrl: config.systemDatabaseUrl!,
+      logger: recorder,
+    }).then((options) => DBOSClient.create(options));
     try {
       (client as unknown as { logger: DLogger }).logger.info('client-marker');
       expect(recorder.find('info', 'client-marker')).toBeDefined();

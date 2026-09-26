@@ -71,7 +71,8 @@
     "test:unit": "jest ./tests --coverage --collectCoverageFrom='src/**/*' --detectOpenHandles",
     "test:packages": "npm run --workspaces test",
     "check:package": "npm run build && publint && attw --pack .",
-    "prepare": "husky"
+    "prepare": "husky",
+    "check:public-api": "node tests/api/check-public-api.cjs && tsc --project tests/api/tsconfig.json"
   },
   "bin": {
     "dbos": "./dist/src/cli/cli.js",

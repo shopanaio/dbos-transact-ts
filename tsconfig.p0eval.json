@@ -1,0 +1,1 @@
+{ "extends": "./tsconfig.json", "compilerOptions": { "noEmit": true, "rootDir": "." }, "include": ["src/**/*", "tests/**/*.ts", "schemas/**/*.ts", "packages/*/index.ts"], "exclude": ["tests/bundler-test/**", "tests/api/**"] }

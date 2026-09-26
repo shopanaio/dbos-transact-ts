@@ -60,7 +60,7 @@ async function indexDefinition(client: Client, name: string): Promise<string | u
   return res.rows[0]?.indexdef;
 }
 
-describe('sysdb migration runner', () => {
+describe('[postgres-only] sysdb migration runner', () => {
   let client: Client;
 
   beforeAll(async () => {
@@ -76,7 +76,7 @@ describe('sysdb migration runner', () => {
     await client.end();
   });
 
-  test('idempotent re-run of full migration list', async () => {
+  test('[postgres-only] idempotent re-run of full migration list', async () => {
     const migrations = allMigrations(TEST_SCHEMA, { useListenNotify: false });
 
     const first = await runSysMigrationsPg(client, migrations, TEST_SCHEMA, {
@@ -136,7 +136,7 @@ describe('sysdb migration runner', () => {
   });
 
   // application_name stays nullable everywhere (NULL is what SDKs predating it write); addressing names stay globally unique.
-  test('shared migrations add nullable application_name and the ownership keys', async () => {
+  test('[postgres-only] shared migrations add nullable application_name and the ownership keys', async () => {
     const migrations = allMigrations(TEST_SCHEMA, { useListenNotify: false });
     await runSysMigrationsPg(client, migrations, TEST_SCHEMA, { onWarn: () => {} });
 
@@ -175,7 +175,7 @@ describe('sysdb migration runner', () => {
   });
 
   // Long-abandoned tables; dropping them leaves the schema identical to every other SDK's at the shared base.
-  test('the consolidated tables are gone, on a fresh database and on an upgrade', async () => {
+  test('[postgres-only] the consolidated tables are gone, on a fresh database and on an upgrade', async () => {
     const migrations = allMigrations(TEST_SCHEMA, { useListenNotify: false });
     const gone = ['workflow_inputs', 'workflow_queue', 'scheduler_state'];
     const survivingTables = async () => {
@@ -209,7 +209,7 @@ describe('sysdb migration runner', () => {
   });
 
   // Renumbering onto the shared base leaves long runs of empty migrations.
-  test('padding to the shared base still lands on the true migration count', async () => {
+  test('[postgres-only] padding to the shared base still lands on the true migration count', async () => {
     const migrations = allMigrations(TEST_SCHEMA, { useListenNotify: false });
     expect(migrations.length).toBeGreaterThan(SHARED_MIGRATION_BASE);
     expect(migrations.filter((m) => (m.pg ?? []).length === 0).length).toBeGreaterThan(0);
@@ -220,7 +220,7 @@ describe('sysdb migration runner', () => {
   });
 
   // A peer sharing the database must never observe a shared migration half-applied (105 replaces a function in place).
-  test('a failing shared migration rolls back whole, and its version with it', async () => {
+  test('[postgres-only] a failing shared migration rolls back whole, and its version with it', async () => {
     const failing = listWithMigrationAt(SHARED_MIGRATION_BASE, {
       pg: [`CREATE TABLE "${TEST_SCHEMA}"."t_shared" (id int)`, `SELECT 1/0`],
     });
@@ -231,7 +231,7 @@ describe('sysdb migration runner', () => {
   });
 
   // No "already applied" tolerance above the base: every SDK must reach the same verdict on a shared migration.
-  test('a shared migration does not tolerate an already-applied statement', async () => {
+  test('[postgres-only] a shared migration does not tolerate an already-applied statement', async () => {
     const duplicated = listWithMigrationAt(SHARED_MIGRATION_BASE, {
       pg: [`CREATE TABLE "${TEST_SCHEMA}"."t_ok" (id int)`, `CREATE TABLE "${TEST_SCHEMA}"."t_ok" (id int)`],
     });
@@ -242,7 +242,7 @@ describe('sysdb migration runner', () => {
   });
 
   // The guarantee starts exactly at the shared base; below it the statement-at-a-time behaviour is unchanged.
-  test('a failing migration below the shared base still applies its earlier statements', async () => {
+  test('[postgres-only] a failing migration below the shared base still applies its earlier statements', async () => {
     const failing = listWithMigrationAt(3, {
       pg: [`CREATE TABLE "${TEST_SCHEMA}"."t_legacy" (id int)`, `SELECT 1/0`],
     });
@@ -251,7 +251,7 @@ describe('sysdb migration runner', () => {
     expect(await tableExists(client, 't_legacy')).toBe(true);
   });
 
-  test('per-version bump on partial failure resumes on retry', async () => {
+  test('[postgres-only] per-version bump on partial failure resumes on retry', async () => {
     const baseSchema: ReadonlyArray<DBMigration> = [
       { pg: [`CREATE SCHEMA IF NOT EXISTS "${TEST_SCHEMA}"`] },
       {
@@ -286,7 +286,7 @@ describe('sysdb migration runner', () => {
     expect(result.appliedCount).toBe(2);
   });
 
-  test('cleans up invalid indexes left by an interrupted CONCURRENTLY build', async () => {
+  test('[postgres-only] cleans up invalid indexes left by an interrupted CONCURRENTLY build', async () => {
     await client.query(`CREATE SCHEMA "${TEST_SCHEMA}"`);
     await client.query(
       `CREATE TABLE "${TEST_SCHEMA}"."dbos_migrations" ("version" bigint not null, constraint "dbos_migrations_pkey_invalid" primary key ("version"))`,

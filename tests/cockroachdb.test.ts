@@ -1,3 +1,4 @@
+import { PostgresSystemDatabase } from '../src/system_database';
 import { DBOS } from '../src/';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
 import { dropPGDatabase } from '../src/database_utils';
@@ -72,7 +73,7 @@ describeIf('cockroachdb', () => {
   beforeEach(async () => {
     await DBOS.launch();
     await DBOS.registerQueue(testQueueName, { onConflict: 'always_update' });
-    const sysDB = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysDB = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     sysDB.dbPollingIntervalResultMs = 100;
     sysDB.dbPollingIntervalEventMs = 100;
   }, CRDB_SCHEMA_TIMEOUT_MS);
@@ -207,7 +208,7 @@ describeIf('cockroachdb', () => {
   });
 
   test('retention', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const client = new Client(config.systemDatabaseUrl);
     // CockroachDB rejects VACUUM outright, so a round that tried would warn on every table,
     // every time. Silence is what proves the round skips it rather than attempting it.

@@ -1,3 +1,4 @@
+import { loadTestSystemDatabase, withTestSystemDatabase } from './system-database-factory';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
 import { DBOS, StatusString, type WorkflowHandle } from '../src';
 import { getClientConfig, INTERNAL_QUEUE_NAME, sleepms } from '../src/utils';
@@ -51,6 +52,23 @@ export function generateDBOSTestConfig(): DBOSConfig {
 
 export async function setUpDBOSTestSysDb(config: DBOSConfig) {
   config.name ??= 'dbostest';
+  const backend = await loadTestSystemDatabase();
+  if (backend) {
+    const injected = await withTestSystemDatabase(config);
+    for (const key of [
+      'systemDatabaseUrl',
+      'systemDatabasePool',
+      'systemDatabasePoolSize',
+      'systemDatabaseSchemaName',
+      'useListenNotify',
+      'notificationCoalesceMs',
+    ] as const)
+      delete config[key];
+    Object.assign(config, injected);
+    if (!backend.reset) throw new Error('Test backend must export reset() for isolated SDK tests');
+    await backend.reset();
+    return;
+  }
   const internalConfig = translateDbosConfig(config);
 
   await dropPGDatabase(internalConfig.systemDatabaseUrl, silentDropLogger);
@@ -202,6 +220,18 @@ export async function reexecuteWorkflowById(
     resetStartedAtEpochMs: true,
   });
   return withDispatchDeadline(DBOS.retrieveWorkflow(workflowId), timeoutMs);
+}
+
+/** Clear the system database between tests: the injected backend's reset(), else drop the PostgreSQL database. */
+export async function resetTestSysDb(config: DBOSConfig) {
+  const backend = await loadTestSystemDatabase();
+  if (backend) {
+    if (!backend.reset) throw new Error('Test backend must export reset() for isolated SDK tests');
+    await backend.reset();
+    return;
+  }
+  expect(config.systemDatabaseUrl).toBeDefined();
+  await dropDatabase(config.systemDatabaseUrl!);
 }
 
 export async function dropDatabase(connectionString: string, database?: string) {

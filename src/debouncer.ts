@@ -1,5 +1,5 @@
 import { DBOS, DBOSClient } from '.';
-import { runTransactionalInternalStep, StartWorkflowParams } from './dbos';
+import { runSystemMutationStep, StartWorkflowParams } from './dbos';
 import { DBOSExecutor } from './dbos-executor';
 import { getNextWFID } from './context';
 import {
@@ -194,7 +194,7 @@ export class Debouncer<Args extends unknown[], Return> {
         serialization: funcArgs.sername,
         applicationName: targetApp,
       };
-      const result = await runTransactionalInternalStep<DebounceResult>(
+      const result = await runSystemMutationStep<DebounceResult>(
         (client) => exec.systemDatabase.debounceDelayedWorkflow(bounceParams, client),
         'DBOS.debounceDelayedWorkflow',
       );

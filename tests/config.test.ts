@@ -12,7 +12,7 @@ import { DBOSConfig } from '../src/dbos-executor';
 import { DBOSJSON } from '../src/serialization';
 import { DBOS } from '../src';
 
-describe('dbos-config', () => {
+describe('[postgres-only] dbos-config', () => {
   beforeEach(() => {
     jest.resetModules();
     process.env = {};
@@ -22,8 +22,8 @@ describe('dbos-config', () => {
     jest.restoreAllMocks();
   });
 
-  describe('readConfigFile', () => {
-    test('reads package name if not specified in config file', async () => {
+  describe('[postgres-only] readConfigFile', () => {
+    test('[postgres-only] reads package name if not specified in config file', async () => {
       const mockConfigFile = `system_database_url: 'postgresql://a:b@c:1234/appdb?connect_timeout=22&sslmode=disable'`;
       jest.spyOn(utils, 'readFile').mockResolvedValueOnce(mockConfigFile);
       const mockPackageJson = `{ "name": "test-app-from-package-json" }`;
@@ -36,7 +36,7 @@ describe('dbos-config', () => {
       });
     });
 
-    test('handles env substitution', async () => {
+    test('[postgres-only] handles env substitution', async () => {
       const database_url = `test-value-${Date.now()}`;
       process.env.MY_DATABASE_URL = database_url;
 
@@ -52,7 +52,7 @@ describe('dbos-config', () => {
       });
     });
 
-    test('handles missing env substitution', async () => {
+    test('[postgres-only] handles missing env substitution', async () => {
       process.env = {};
 
       const mockConfigFile = `
@@ -71,7 +71,7 @@ describe('dbos-config', () => {
       readonly code = 'ENOENT';
     }
 
-    test('config and package files not found', async () => {
+    test('[postgres-only] config and package files not found', async () => {
       jest.spyOn(utils, 'readFile').mockImplementation(() => {
         throw new FakeNotFoundError('not found');
       });
@@ -79,7 +79,7 @@ describe('dbos-config', () => {
       expect(configFile).toEqual({});
     });
 
-    test('config file not found', async () => {
+    test('[postgres-only] config file not found', async () => {
       jest.spyOn(utils, 'readFile').mockImplementationOnce(() => {
         throw new FakeNotFoundError('not found');
       });
@@ -88,7 +88,7 @@ describe('dbos-config', () => {
       expect(configFile).toEqual({ name: 'test-app-from-package-json' });
     });
 
-    test('package file not found', async () => {
+    test('[postgres-only] package file not found', async () => {
       jest
         .spyOn(utils, 'readFile')
         .mockResolvedValueOnce(
@@ -103,7 +103,7 @@ describe('dbos-config', () => {
       });
     });
 
-    test('does not read package if config file has name', async () => {
+    test('[postgres-only] does not read package if config file has name', async () => {
       jest.spyOn(utils, 'readFile').mockResolvedValueOnce(`name: 'test-app'`);
       jest.spyOn(utils, 'readFile').mockImplementationOnce(() => {
         throw new Error('Should not be called');
@@ -112,14 +112,14 @@ describe('dbos-config', () => {
       expect(configFile).toEqual({ name: 'test-app' });
     });
 
-    test('throws on non-ENOENT config read error', async () => {
+    test('[postgres-only] throws on non-ENOENT config read error', async () => {
       jest.spyOn(utils, 'readFile').mockImplementation(() => {
         throw new Error('Some other error');
       });
       await expect(readConfigFile()).rejects.toThrow(new Error('Some other error'));
     });
 
-    test('throws on non-ENOENT package read error', async () => {
+    test('[postgres-only] throws on non-ENOENT package read error', async () => {
       jest.spyOn(utils, 'readFile').mockImplementationOnce(() => {
         throw new FakeNotFoundError('not found');
       });
@@ -130,8 +130,8 @@ describe('dbos-config', () => {
     });
   });
 
-  describe('getDbosConfig', () => {
-    test('logLevel default', () => {
+  describe('[postgres-only] getDbosConfig', () => {
+    test('[postgres-only] logLevel default', () => {
       const configFile: ConfigFile = {
         name: 'test-app',
       };
@@ -139,7 +139,7 @@ describe('dbos-config', () => {
       expect(config.telemetry.logs.logLevel).toEqual('info');
     });
 
-    test('logLevel specified', () => {
+    test('[postgres-only] logLevel specified', () => {
       const configFile: ConfigFile = {
         name: 'test-app',
         telemetry: {
@@ -152,7 +152,7 @@ describe('dbos-config', () => {
       expect(config.telemetry.logs.logLevel).toEqual('debug');
     });
 
-    test('logLevel override', () => {
+    test('[postgres-only] logLevel override', () => {
       const configFile: ConfigFile = {
         name: 'test-app',
         telemetry: {
@@ -165,7 +165,7 @@ describe('dbos-config', () => {
       expect(config.telemetry.logs.logLevel).toEqual('error');
     });
 
-    test('returns correct database url', () => {
+    test('[postgres-only] returns correct database url', () => {
       const configFile: ConfigFile = {
         name: 'test-app',
         system_database_url: 'postgresql://a:b@c:1234/appdb?connect_timeout=22&sslmode=disable',
@@ -174,7 +174,7 @@ describe('dbos-config', () => {
       expect(config.systemDatabaseUrl).toBe('postgresql://a:b@c:1234/appdb?connect_timeout=22&sslmode=disable');
     });
 
-    test('handles node language', () => {
+    test('[postgres-only] handles node language', () => {
       const configFile: ConfigFile = {
         name: 'test-app',
         language: 'node',
@@ -183,7 +183,7 @@ describe('dbos-config', () => {
       expect(() => getDbosConfig(configFile)).not.toThrow();
     });
 
-    test('handles missing language', () => {
+    test('[postgres-only] handles missing language', () => {
       const configFile: ConfigFile = {
         name: 'test-app',
         system_database_url: 'postgresql://a:b@c:1234/appdb?connect_timeout=22&sslmode=disable',
@@ -191,7 +191,7 @@ describe('dbos-config', () => {
       expect(() => getDbosConfig(configFile)).not.toThrow();
     });
 
-    test('throws on non node language', () => {
+    test('[postgres-only] throws on non node language', () => {
       const configFile: ConfigFile = {
         name: 'test-app',
         language: 'not-node',
@@ -201,8 +201,8 @@ describe('dbos-config', () => {
     });
   });
 
-  describe('getSystemDatabaseUrl', () => {
-    test('uses system_database_url from config when provided', () => {
+  describe('[postgres-only] getSystemDatabaseUrl', () => {
+    test('[postgres-only] uses system_database_url from config when provided', () => {
       const databaseUrl = getSystemDatabaseUrl({
         name: 'Test App',
         system_database_url: 'postgresql://a:b@c:1234/appdb?connect_timeout=22&sslmode=disable',
@@ -210,7 +210,7 @@ describe('dbos-config', () => {
       expect(databaseUrl).toBe('postgresql://a:b@c:1234/appdb?connect_timeout=22&sslmode=disable');
     });
 
-    test('uses default values when config is empty', () => {
+    test('[postgres-only] uses default values when config is empty', () => {
       const databaseUrl = getSystemDatabaseUrl({
         name: 'Test App',
       });
@@ -219,11 +219,11 @@ describe('dbos-config', () => {
       );
     });
 
-    test('throws when db url not set and app name is missing', () => {
+    test('[postgres-only] throws when db url not set and app name is missing', () => {
       expect(() => getSystemDatabaseUrl({})).toThrow(AssertionError);
     });
 
-    test('uses PG env values when config is empty', () => {
+    test('[postgres-only] uses PG env values when config is empty', () => {
       process.env.PGHOST = 'envhost';
       process.env.PGPORT = '7777';
       process.env.PGUSER = 'envuser';
@@ -237,7 +237,7 @@ describe('dbos-config', () => {
       );
     });
 
-    test('correctly handles app names with spaces', () => {
+    test('[postgres-only] correctly handles app names with spaces', () => {
       const url = getSystemDatabaseUrl({
         name: 'app name with spaces',
       });
@@ -246,14 +246,14 @@ describe('dbos-config', () => {
       );
     });
 
-    test('correctly handles db url w/o password', () => {
+    test('[postgres-only] correctly handles db url w/o password', () => {
       const url = getSystemDatabaseUrl({
         system_database_url: 'postgresql://postgres@localhost:5432/dbostest?sslmode=disable',
       });
       expect(url).toBe('postgresql://postgres@localhost:5432/dbostest?sslmode=disable');
     });
 
-    test('throws with invalid system_database_url format', () => {
+    test('[postgres-only] throws with invalid system_database_url format', () => {
       expect(() => getSystemDatabaseUrl({ system_database_url: 'not-a-valid-url' })).toThrow();
     });
 
@@ -272,8 +272,8 @@ describe('dbos-config', () => {
     );
   });
 
-  describe('translateDbosConfig', () => {
-    test('translate with name', () => {
+  describe('[postgres-only] translateDbosConfig', () => {
+    test('[postgres-only] translate with name', () => {
       const internalConfig = translateDbosConfig({
         name: 'dbostest',
       });
@@ -309,7 +309,7 @@ describe('dbos-config', () => {
       });
     });
 
-    test('translate passes through systemDatabasePollingConcurrency', () => {
+    test('[postgres-only] translate passes through systemDatabasePollingConcurrency', () => {
       let internalConfig = translateDbosConfig({
         name: 'dbostest',
         systemDatabasePoolSize: 50,
@@ -318,7 +318,7 @@ describe('dbos-config', () => {
       expect(internalConfig.sysDbPoolSize).toBe(50);
       expect(internalConfig.systemDatabasePollingConcurrency).toBe(8);
       // When unset, translation leaves it undefined; the default (half the pool)
-      // is materialized later in the SystemDatabase constructor.
+      // is materialized later in the PostgresSystemDatabase constructor.
       internalConfig = translateDbosConfig({
         name: 'dbostest',
         systemDatabasePoolSize: 50,
@@ -327,7 +327,7 @@ describe('dbos-config', () => {
       expect(internalConfig.systemDatabasePollingConcurrency).toBeUndefined();
     });
 
-    test('translate validates maxConcurrentQueueDispatches', () => {
+    test('[postgres-only] translate validates maxConcurrentQueueDispatches', () => {
       const internalConfig = translateDbosConfig({
         name: 'dbostest',
         maxConcurrentQueueDispatches: 4,
@@ -343,7 +343,7 @@ describe('dbos-config', () => {
       }
     });
 
-    test('translate validates notificationCoalesceMs', () => {
+    test('[postgres-only] translate validates notificationCoalesceMs', () => {
       // A valid value is threaded through.
       expect(translateDbosConfig({ name: 'dbostest', notificationCoalesceMs: 1 }).notificationCoalesceMs).toBe(1);
       // Unset is allowed (the system database defaults it).
@@ -356,7 +356,7 @@ describe('dbos-config', () => {
       }
     });
 
-    test('translate passes through a custom logger', () => {
+    test('[postgres-only] translate passes through a custom logger', () => {
       const myLogger = { info: () => {}, debug: () => {}, warn: () => {}, error: () => {} };
       let internalConfig = translateDbosConfig({ name: 'dbostest', logger: myLogger });
       expect(internalConfig.telemetry.logs.logger).toBe(myLogger);
@@ -364,7 +364,7 @@ describe('dbos-config', () => {
       expect(internalConfig.telemetry.logs.logger).toBeUndefined();
     });
 
-    test('translate with db url', () => {
+    test('[postgres-only] translate with db url', () => {
       const internalConfig = translateDbosConfig({
         systemDatabaseUrl:
           'postgres://jon:doe@mother:2345/dbostest?sslmode=require&sslrootcert=my_cert&connect_timeout=7',
@@ -401,7 +401,7 @@ describe('dbos-config', () => {
       });
     });
 
-    test('translate with db & sysdb urls', () => {
+    test('[postgres-only] translate with db & sysdb urls', () => {
       const internalConfig = translateDbosConfig({
         systemDatabaseUrl: 'postgres://foo:bar@father:1234/blahblahblah',
       });
@@ -437,7 +437,7 @@ describe('dbos-config', () => {
     });
   });
 
-  describe('overwriteConfigForDBOSCloud', () => {
+  describe('[postgres-only] overwriteConfigForDBOSCloud', () => {
     const config: DBOSConfig = {
       name: 'my-app',
       systemDatabaseUrl: 'postgres://foo:bar@father:1234/blahblahblah',
@@ -446,29 +446,29 @@ describe('dbos-config', () => {
       otlpLogsEndpoints: ['http://otel-collector:4317/logs'],
     };
 
-    test('throws when cloud db url is missing', () => {
+    test('[postgres-only] throws when cloud db url is missing', () => {
       expect(() => overwriteConfigForDBOSCloud(config)).toThrow(AssertionError);
     });
 
-    test('uses cloud app name', () => {
+    test('[postgres-only] uses cloud app name', () => {
       process.env.DBOS_SYSTEM_DATABASE_URL = 'fake://db/url';
       process.env.DBOS_APP_NAME = 'cloud-app-name';
       expect(overwriteConfigForDBOSCloud(config).name).toBe('cloud-app-name');
     });
 
-    test('keeps configured app name when cloud app name is unset', () => {
+    test('[postgres-only] keeps configured app name when cloud app name is unset', () => {
       process.env.DBOS_SYSTEM_DATABASE_URL = 'fake://db/url';
       expect(overwriteConfigForDBOSCloud(config).name).toBe('my-app');
     });
 
-    test('uses cloud sys db url', () => {
+    test('[postgres-only] uses cloud sys db url', () => {
       process.env.DBOS_SYSTEM_DATABASE_URL = 'postgres://a:b@c:2345/cloud_sys_db';
       const newConfig = overwriteConfigForDBOSCloud(config);
       expect(newConfig.systemDatabaseUrl).toBe('postgres://a:b@c:2345/cloud_sys_db');
       expect(newConfig.systemDatabaseSchemaName).toBe('my_schema');
     });
 
-    test('combine otel endpoints', () => {
+    test('[postgres-only] combine otel endpoints', () => {
       process.env.DBOS_SYSTEM_DATABASE_URL = 'fake://db/url';
       process.env.DBOS__OTLP_TRACES_ENDPOINT = 'http://otel-collector:4318/v1/traces';
       process.env.DBOS__OTLP_LOGS_ENDPOINT = 'http://otel-collector:4318/v1/logs';
@@ -483,7 +483,7 @@ describe('dbos-config', () => {
       ]);
     });
 
-    test('combine otel endpoints no duplicates', () => {
+    test('[postgres-only] combine otel endpoints no duplicates', () => {
       process.env.DBOS_SYSTEM_DATABASE_URL = 'fake://db/url';
       process.env.DBOS__OTLP_TRACES_ENDPOINT = 'http://otel-collector:4317/traces';
       process.env.DBOS__OTLP_LOGS_ENDPOINT = 'http://otel-collector:4317/logs';
@@ -492,7 +492,7 @@ describe('dbos-config', () => {
       expect(newConfig.otlpTracesEndpoints).toEqual(['http://otel-collector:4317/traces']);
     });
 
-    test('works without any provided config', () => {
+    test('[postgres-only] works without any provided config', () => {
       process.env.DBOS_SYSTEM_DATABASE_URL = 'postgres://a:b@c:2345/cloud_sys_db';
       process.env.DBOS_APP_NAME = 'cloud-app-name';
       process.env.DBOS__OTLP_LOGS_ENDPOINT = 'http://otel-collector:4318/v1/logs';
@@ -503,7 +503,7 @@ describe('dbos-config', () => {
       expect(internalConfig.telemetry.OTLPExporter.tracesEndpoint).toEqual([]);
     });
 
-    test('getDbosConfig applies the cloud environment', () => {
+    test('[postgres-only] getDbosConfig applies the cloud environment', () => {
       // DBOS__CLOUD is read once at import, so set the flag it produces.
       const wasCloud = utils.globalParams.dbosCloud;
       utils.globalParams.dbosCloud = true;
@@ -521,12 +521,12 @@ describe('dbos-config', () => {
     });
   });
 
-  describe('DBOS.launch', () => {
-    test('requires setConfig outside DBOS Cloud', async () => {
+  describe('[postgres-only] DBOS.launch', () => {
+    test('[postgres-only] requires setConfig outside DBOS Cloud', async () => {
       await expect(DBOS.launch()).rejects.toThrow('call DBOS.setConfig before DBOS.launch');
     });
 
-    test('requires an application name', async () => {
+    test('[postgres-only] requires an application name', async () => {
       // JavaScript callers can omit the name the type requires.
       DBOS.setConfig({ systemDatabaseUrl: 'postgres://postgres:dbos@localhost:5432/unnamed_sys' } as DBOSConfig);
       await expect(DBOS.launch()).rejects.toThrow('No application name was provided');
@@ -535,8 +535,8 @@ describe('dbos-config', () => {
   });
 });
 
-describe('batch polling configuration (SC-qp06)', () => {
-  test('defaults and explicit overrides survive translation', () => {
+describe('[postgres-only] batch polling configuration (SC-qp06)', () => {
+  test('[postgres-only] defaults and explicit overrides survive translation', () => {
     expect(translateDbosConfig({ name: 'test' })).toMatchObject({
       queuePollingBatchSize: 1000,
       queuePollingCoalesceMs: 50,

@@ -1,3 +1,4 @@
+import { PostgresSystemDatabase } from '../src/system_database';
 import { randomUUID } from 'node:crypto';
 
 import { ConfiguredInstance, DBOS, StatusString } from '../src';
@@ -46,7 +47,7 @@ function unpolledQueue() {
 }
 
 async function createdAtByWorkflowID(prefix: string): Promise<Map<string, { createdAt: number; key: string | null }>> {
-  const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+  const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
   const { rows } = await sysdb.pool.query<{
     workflow_uuid: string;
     created_at: string;
@@ -226,7 +227,7 @@ describe('batch-enqueue', () => {
     expect(Math.max(...allCreated) - Math.min(...allCreated)).toBe(perKey - 1);
   });
 
-  test('a fresh owner re-seeds its created_at cursor from the database', async () => {
+  test('[postgres-only] a fresh owner re-seeds its created_at cursor from the database', async () => {
     // Regression: a restart/rebalance must re-seed from the DB high-water mark. The backlog is
     // forced an hour into the future, so a fresh owner that fell back to wall-clock would sort
     // its newer rows *below* the backlog and invert per-key order.
@@ -247,7 +248,7 @@ describe('batch-enqueue', () => {
     expect((await enqueueWorkflows(await build(0, 5))).size).toBe(5);
 
     // Drift the backlog an hour ahead: wall-clock alone can no longer order past it.
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const future = Date.now() + 3_600_000;
     await sysdb.pool.query(
       `UPDATE "${sysdb.schemaName}".workflow_status
@@ -257,7 +258,7 @@ describe('batch-enqueue', () => {
     );
 
     // Simulate a fresh owner: shutting down and relaunching drops the in-memory cursors along with
-    // the old SystemDatabase instance, so the next batch can only order correctly by re-seeding.
+    // the old PostgresSystemDatabase instance, so the next batch can only order correctly by re-seeding.
     await DBOS.shutdown();
     await DBOS.launch();
 

@@ -1,3 +1,4 @@
+import { withTestSystemDatabase } from '../../../tests/system-database-factory';
 import 'reflect-metadata';
 
 import { User } from './demoentities/User';
@@ -80,7 +81,7 @@ describe('TypeOrmDataSourceDemo', () => {
     await TypeOrmDataSource.initializeDBOSSchema(config);
     await AppDataSource.initialize();
 
-    DBOS.setConfig({ name: 'typeorm-demo-ds' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'typeorm-demo-ds' }));
     await DBOS.launch();
   });
 

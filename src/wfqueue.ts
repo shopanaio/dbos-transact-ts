@@ -1,10 +1,16 @@
+import { SystemDatabaseContentionError } from './error';
 import { DBOSExecutor } from './dbos-executor';
 import {
   DEBUG_TRIGGER_WORKFLOW_QUEUE_START,
   DEBUG_TRIGGER_BETWEEN_PARTITION_DISPATCHES,
   debugTriggerPoint,
 } from './debugpoint';
-import { QueueUnavailableError, type QueueControlState, type QueueRecord, type SystemDatabase } from './system_database';
+import {
+  QueueUnavailableError,
+  type QueueControlState,
+  type QueueRecord,
+  type SystemDatabase,
+} from './system_database';
 import type { GlobalLogger } from './telemetry/logs';
 import { globalParams, RESERVED_QUEUE_NAME_PREFIX } from './utils';
 
@@ -132,8 +138,7 @@ function workerBudget(queue: WorkflowQueue, running: number): number {
 
 /** 40001 serialization_failure or 55P03 lock_not_available: a peer is claiming the same rows. */
 function isContentionError(e: unknown): boolean {
-  const code = (e as NodeJS.ErrnoException).code;
-  return code === '40001' || code === '55P03';
+  return e instanceof SystemDatabaseContentionError;
 }
 
 /** Fisher-Yates copy, so a sweep visits partitions in a different order each poll. */
@@ -240,9 +245,15 @@ export class WorkflowQueue {
   queueId!: string;
   paused!: boolean;
 
-  pause(): Promise<QueueControlState> { return sysDBFor(this).setQueuePaused(this.name, true); }
-  wake(): Promise<QueueControlState> { return sysDBFor(this).setQueuePaused(this.name, false); }
-  getControlState(): Promise<QueueControlState> { return sysDBFor(this).getQueueControlState(this.name); }
+  pause(): Promise<QueueControlState> {
+    return sysDBFor(this).setQueuePaused(this.name, true);
+  }
+  wake(): Promise<QueueControlState> {
+    return sysDBFor(this).setQueuePaused(this.name, false);
+  }
+  getControlState(): Promise<QueueControlState> {
+    return sysDBFor(this).getQueueControlState(this.name);
+  }
   /**
    * Last-known cached values. May be stale for database-backed queues if
    * another process has modified the row. Use getters instead.
@@ -606,8 +617,12 @@ class WFQueueRunner {
   private readonly jitterMin = 0.95;
   private readonly jitterMax = 1.05;
 
-  addInternalQueue(queue: WorkflowQueue): void { this.internalQueues.set(queue.name, queue); }
-  getInternalQueue(name: string): WorkflowQueue | undefined { return this.internalQueues.get(name); }
+  addInternalQueue(queue: WorkflowQueue): void {
+    this.internalQueues.set(queue.name, queue);
+  }
+  getInternalQueue(name: string): WorkflowQueue | undefined {
+    return this.internalQueues.get(name);
+  }
   private wake(): void {
     if (!this.isRunning) return;
     if (this.wakeScheduler) this.wakeScheduler();
@@ -642,9 +657,14 @@ class WFQueueRunner {
     }
     const interval = queue.minPollingIntervalMs ?? WFQueueRunner.defaultMinPollingIntervalMs;
     this.states.set(queue.name, {
-      queue, generation: ++this.generation, phase: 'idle', currentPollingMs: interval,
-      nextPollAt: now + interval, forcePollPending: false,
-      waitingForWorkerBudget: false, nextBudgetCheckAt: now,
+      queue,
+      generation: ++this.generation,
+      phase: 'idle',
+      currentPollingMs: interval,
+      nextPollAt: now + interval,
+      forcePollPending: false,
+      waitingForWorkerBudget: false,
+      nextBudgetCheckAt: now,
     });
   }
 
@@ -652,18 +672,25 @@ class WFQueueRunner {
     const present = new Set<string>();
     for (const record of records) {
       if (this.internalQueues.has(record.name)) continue;
-      if (this.listenQueueNames && !this.listenQueueNames.has(record.name) && !this.pollerQueueNames.has(record.name)) continue;
+      if (this.listenQueueNames && !this.listenQueueNames.has(record.name) && !this.pollerQueueNames.has(record.name))
+        continue;
       present.add(record.name);
       this.ensureState(new WorkflowQueue(record), Date.now());
     }
     const selected = names ? new Set(names) : undefined;
     for (const [name, state] of this.states) {
-      if (state.queue.databaseBacked && (!selected || selected.has(name)) && !present.has(name)) this.states.delete(name);
+      if (state.queue.databaseBacked && (!selected || selected.has(name)) && !present.has(name))
+        this.states.delete(name);
     }
   }
 
-  async dispatchLoop(exec: DBOSExecutor, listenQueuesArg: string[] | null,
-    maxConcurrentQueueDispatches = 3, batchSize = 1000, coalesceMs = 50): Promise<void> {
+  async dispatchLoop(
+    exec: DBOSExecutor,
+    listenQueuesArg: string[] | null,
+    maxConcurrentQueueDispatches = 3,
+    batchSize = 1000,
+    coalesceMs = 50,
+  ): Promise<void> {
     this.isRunning = true;
     this.states.clear();
     this.wakePending = false;
@@ -689,8 +716,11 @@ class WFQueueRunner {
     const jitter = (ms: number) => ms * (0.95 + Math.random() * 0.1);
     const hint = (name?: string) => {
       if (!this.isRunning) return;
-      if (!name || dirty.size >= batchSize) { fullPending = true; forceAllPending = true; dirty.clear(); }
-      else if (!forceAllPending) dirty.add(name);
+      if (!name || dirty.size >= batchSize) {
+        fullPending = true;
+        forceAllPending = true;
+        dirty.clear();
+      } else if (!forceAllPending) dirty.add(name);
       this.wake();
     };
     const budgetHint = (name: string) => {
@@ -724,8 +754,11 @@ class WFQueueRunner {
     };
     const wait = async (ms: number) => {
       if (signal.aborted) return;
-      if (this.wakePending) { this.wakePending = false; return; }
-      await new Promise<void>(resolve => {
+      if (this.wakePending) {
+        this.wakePending = false;
+        return;
+      }
+      await new Promise<void>((resolve) => {
         const finish = () => {
           clearTimeout(timer);
           signal.removeEventListener('abort', finish);
@@ -775,22 +808,33 @@ class WFQueueRunner {
               metadataBackoff = Math.min(1000, metadataBackoff ? metadataBackoff * 2 : 100);
               metadataRetryAt = Date.now() + jitter(metadataBackoff);
               exec.logger.warn(`Error refreshing queue metadata: ${String(error)}`);
-            } finally { metadata = undefined; this.wake(); }
+            } finally {
+              metadata = undefined;
+              this.wake();
+            }
           })();
         }
         if (!transition && now >= transitionAt) {
           transition = (async () => {
-            try { await db.transitionDelayedWorkflows(); }
-            catch (error) { exec.logger.warn(`Error transitioning delayed workflows: ${String(error)}`); }
-            finally { transitionAt = Date.now() + 1000; transition = undefined; this.wake(); }
+            try {
+              await db.transitionDelayedWorkflows();
+            } catch (error) {
+              exec.logger.warn(`Error transitioning delayed workflows: ${String(error)}`);
+            } finally {
+              transitionAt = Date.now() + 1000;
+              transition = undefined;
+              this.wake();
+            }
           })();
         }
         for (const state of this.states.values()) {
-          if (!state.queue.paused && state.waitingForWorkerBudget && now >= state.nextBudgetCheckAt) budgetAvailable(state, now);
+          if (!state.queue.paused && state.waitingForWorkerBudget && now >= state.nextBudgetCheckAt)
+            budgetAvailable(state, now);
         }
-        const available = () => [...this.states.values()]
-          .filter(s => !s.queue.paused && !s.waitingForWorkerBudget && !reservations.has(s.queue.name))
-          .sort((a, b) => a.nextPollAt - b.nextPollAt);
+        const available = () =>
+          [...this.states.values()]
+            .filter((s) => !s.queue.paused && !s.waitingForWorkerBudget && !reservations.has(s.queue.name))
+            .sort((a, b) => a.nextPollAt - b.nextPollAt);
 
         for (const state of available()) {
           if (claims.size >= maxConcurrentQueueDispatches) break;
@@ -820,23 +864,39 @@ class WFQueueRunner {
           claims.add(task);
         }
         if (!probe && now >= probeRetryAt) {
-          const batch = available().filter(s => s.phase === 'idle' && slot(s.nextPollAt) <= now)
-            .filter(s => budgetAvailable(s, now)).slice(0, batchSize);
+          const batch = available()
+            .filter((s) => s.phase === 'idle' && slot(s.nextPollAt) <= now)
+            .filter((s) => budgetAvailable(s, now))
+            .slice(0, batchSize);
           if (batch.length) {
-            const snapshots = batch.map(state => {
+            const snapshots = batch.map((state) => {
               const token = Symbol(state.queue.name);
               reservations.set(state.queue.name, token);
               state.token = token;
               state.phase = 'probing';
               state.forcePollPending = false;
-              return { state, generation: state.generation, token, request: {
-                name: state.queue.name, queueId: state.queue.queueId, generation: state.generation,
-                internal: !state.queue.databaseBacked,
-              }};
+              return {
+                state,
+                generation: state.generation,
+                token,
+                request: {
+                  name: state.queue.name,
+                  queueId: state.queue.queueId,
+                  generation: state.generation,
+                  internal: !state.queue.databaseBacked,
+                },
+              };
             });
             probe = (async () => {
               try {
-                const ready = new Set((await db.findQueuesWithEnqueuedWorkflows(snapshots.map(s => s.request), globalParams.appVersion)).map(r => r.name));
+                const ready = new Set(
+                  (
+                    await db.findQueuesWithEnqueuedWorkflows(
+                      snapshots.map((s) => s.request),
+                      globalParams.appVersion,
+                    )
+                  ).map((r) => r.name),
+                );
                 probeBackoff = 0;
                 probeRetryAt = 0;
                 for (const { state, generation } of snapshots) {
@@ -864,7 +924,8 @@ class WFQueueRunner {
           if (state.queue.paused || reservations.has(state.queue.name)) continue;
           if (state.waitingForWorkerBudget) next = Math.min(next, state.nextBudgetCheckAt);
           else if (state.phase === 'ready' && claims.size < maxConcurrentQueueDispatches) next = Math.min(next, now);
-          else if (state.phase === 'idle' && !probe) next = Math.min(next, Math.max(probeRetryAt, slot(state.nextPollAt)));
+          else if (state.phase === 'idle' && !probe)
+            next = Math.min(next, Math.max(probeRetryAt, slot(state.nextPollAt)));
         }
         await wait(Number.isFinite(next) ? Math.max(0, next - Date.now()) : 1000);
       }
@@ -872,7 +933,10 @@ class WFQueueRunner {
       this.isRunning = false;
       db.queueControlListeners.delete(hint);
       db.queueBudgetListeners.delete(budgetHint);
-      await Promise.allSettled([...claims, ...[probe, metadata, transition].filter((p): p is Promise<void> => p !== undefined)]);
+      await Promise.allSettled([
+        ...claims,
+        ...[probe, metadata, transition].filter((p): p is Promise<void> => p !== undefined),
+      ]);
       this.wakeScheduler = undefined;
       this.wakePending = false;
     }

@@ -1,3 +1,5 @@
+import { PostgresSystemDatabase } from '../src/system_database';
+import { withTestClientDatabase } from './system-database-factory';
 import { Client } from 'pg';
 import { DBOS, DBOSClient, StatusString } from '../src';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
@@ -140,7 +142,9 @@ describe('application-name', () => {
     const queue = await DBOS.registerQueue('appname-client-queue');
     expect(queue.name).toBe('appname-client-queue');
 
-    const anonymous = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const anonymous = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       const handle = await anonymous.enqueue<NoArgWorkflow>({
         queueName: 'appname-client-queue',
@@ -151,10 +155,10 @@ describe('application-name', () => {
       await anonymous.destroy();
     }
 
-    const named = await DBOSClient.create({
+    const named = await withTestClientDatabase({
       systemDatabaseUrl: config.systemDatabaseUrl!,
       applicationName: PEER,
-    });
+    }).then((options) => DBOSClient.create(options));
     try {
       expect(named.applicationName).toBe(PEER);
       const own = await named.enqueue<NoArgWorkflow>({
@@ -260,7 +264,9 @@ describe('application-name', () => {
     expect(theirIDs).not.toContain(mine.workflowID);
 
     // A client with no application of its own has no scope to default to.
-    const anon = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const anon = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       const anonIDs = (await anon.listWorkflows({})).map((w) => w.workflowID);
       expect(anonIDs).toEqual(
@@ -270,7 +276,7 @@ describe('application-name', () => {
       await anon.destroy();
     }
 
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const aggregates = await sysdb.getWorkflowAggregates({
       groupByName: true,
       selectCount: true,
@@ -313,7 +319,7 @@ describe('application-name', () => {
     }
 
     await DBOS.launch();
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     await DBOS.createSchedule({
       scheduleName: 'appname-mine',
       workflowFn: ScheduleTest.scheduled,
@@ -358,7 +364,9 @@ describe('application-name', () => {
     expect(new Set(theirs.map((q) => q.applicationName ?? null))).toEqual(new Set([PEER, null]));
 
     // The client runs the same query, so it takes the same filter.
-    const peerClient = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const peerClient = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       expect(new Set((await peerClient.listQueues(PEER)).map((q) => q.name))).toEqual(
         new Set(['appname-theirs-queue', 'appname-unclaimed-queue']),
@@ -401,7 +409,9 @@ describe('application-name', () => {
     await insertPeerWorkflow(client, 'appname-dequeue-peer', { queueName: queue.name });
 
     // An unclaimed workflow belongs to every application, so this one claims it.
-    const anonymous = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const anonymous = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     let unclaimedID: string;
     try {
       const handle = await anonymous.enqueue<NoArgWorkflow>({
@@ -461,10 +471,10 @@ describe('application-name', () => {
     const ourVersion = DBOS.applicationVersion;
 
     // A peer registers a newer version; it must not become our latest.
-    const peer = await DBOSClient.create({
+    const peer = await withTestClientDatabase({
       systemDatabaseUrl: config.systemDatabaseUrl!,
       applicationName: PEER,
-    });
+    }).then((options) => DBOSClient.create(options));
     try {
       await client.query(
         `INSERT INTO dbos.application_versions (version_id, version_name, version_timestamp, application_name)
@@ -496,10 +506,10 @@ describe('application-name', () => {
       schedule: '0 0 * * * *',
     });
 
-    const peer = await DBOSClient.create({
+    const peer = await withTestClientDatabase({
       systemDatabaseUrl: config.systemDatabaseUrl!,
       applicationName: PEER,
-    });
+    }).then((options) => DBOSClient.create(options));
     try {
       await expect(peer.registerQueue('appname-contested-queue')).rejects.toThrow(
         /already registered by application 'appname-test-app'/,
@@ -534,7 +544,9 @@ describe('application-name', () => {
     const version = DBOS.applicationVersion;
     await DBOS.shutdown();
 
-    const admin = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const admin = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       await expect(admin.renameApplication(APP, APP)).rejects.toThrow(/already holds that name/);
       await expect(admin.renameApplication(undefined, 'renamed-app')).rejects.toThrow(/Nothing to re-own/);
@@ -569,7 +581,9 @@ describe('application-name', () => {
     await insertPeerWorkflow(client, 'appname-rename-peer');
     await insertPeerWorkflow(client, 'appname-rename-unclaimed', { applicationName: null });
 
-    const admin = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const admin = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       // Unclaimed rows are not implied; they move only when asked.
       await admin.renameApplication(APP, 'renamed-app');
@@ -596,7 +610,9 @@ describe('application-name', () => {
       });
     }
 
-    const admin = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const admin = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       // A batch size below the row count exercises the key-range walk.
       const moved = await admin.renameApplication(APP, 'renamed-app', { batchSize: 2 });

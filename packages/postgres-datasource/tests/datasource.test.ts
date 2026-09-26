@@ -1,3 +1,4 @@
+import { withTestSystemDatabase } from '../../../tests/system-database-factory';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { Client, Pool } from 'pg';
 import { PostgresDataSource } from '..';
@@ -27,7 +28,7 @@ describe('PostgresDataSource', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'pg-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'pg-ds-test' }));
     await DBOS.launch();
   });
 
@@ -547,7 +548,7 @@ describe('PostgresDataSourceCreateTxC', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'pg-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'pg-ds-test' }));
     await DBOS.launch();
   });
 

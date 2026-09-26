@@ -1,3 +1,4 @@
+import { withTestSystemDatabase } from '../../../tests/system-database-factory';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { Client, Pool } from 'pg';
 import { TypeOrmDataSource } from '..';
@@ -37,7 +38,7 @@ describe('TypeOrmDataSource', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'typeorm-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'typeorm-ds-test' }));
     await DBOS.launch();
   });
 
@@ -555,7 +556,7 @@ describe('TypeOrmDataSourceCreateTxC', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'typeorm-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'typeorm-ds-test' }));
     await DBOS.launch();
   });
 

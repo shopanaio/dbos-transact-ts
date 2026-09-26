@@ -1,3 +1,4 @@
+import { PostgresSystemDatabase } from '../src/system_database';
 import { ConfiguredInstance, DBOS, DBOSConfig, StatusString } from '../src';
 import { DBOSExecutor } from '../src/dbos-executor';
 import { DBOSNotRegisteredError } from '../src/error';
@@ -352,7 +353,7 @@ describe('recovery-cc-tests', () => {
 
     // A claimed row is PENDING, which is what the dispatcher hands to executeDequeuedWorkflow.
     await setWfAndChildrenToPending(handle.workflowID);
-    const sysDB = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysDB = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const claimed = (await sysDB.getWorkflowStatus(handle.workflowID))!;
     expect(claimed.status).toBe(StatusString.PENDING);
     claimed.workflowConfigName = 'no-such-instance';

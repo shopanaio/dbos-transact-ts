@@ -1,3 +1,4 @@
+import { withTestSystemDatabase } from '../../../tests/system-database-factory';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { Client, Pool } from 'pg';
 import { KnexDataSource } from '..';
@@ -27,7 +28,7 @@ describe('KnexDataSource', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'knex-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'knex-ds-test' }));
     await DBOS.launch();
   });
 
@@ -544,7 +545,7 @@ describe('KnexDataSourceCreateTxCompletion', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'knex-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'knex-ds-test' }));
     await DBOS.launch();
   });
 

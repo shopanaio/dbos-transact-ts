@@ -1,3 +1,4 @@
+import type { SystemDatabaseStoredResult } from './system_database';
 import { DBOSContextualLogger } from './telemetry/logs';
 import { AsyncLocalStorage } from 'async_hooks';
 import { DBOSInvalidWorkflowTransitionError } from './error';
@@ -28,6 +29,9 @@ export interface DBOSContextOptions {
 
 export interface DBOSLocalCtx extends DBOSContextOptions {
   workflowId?: string;
+  creationOpId?: string;
+  prefetchedOperationResults?: Map<number, SystemDatabaseStoredResult>;
+  prefetchedMaxFunctionId?: number;
   workflowQueueName?: string;
   curWFFunctionId?: number; // If currently in a WF, the current call number / ID
   activeStreamReads?: number; // Checkpointed stream reads that have reserved a step but not yet recorded it
@@ -167,4 +171,10 @@ export async function runInStepContext<R>(
     },
     callback,
   );
+}
+
+/** Метаданные исполнения для backend-а; поколение нельзя изменять через этот объект. */
+export function getSystemDatabaseExecutionContext(): Readonly<{ workflowId?: string; creationOpId?: string }> {
+  const context = getCurrentContextStore();
+  return { workflowId: context?.workflowId, creationOpId: context?.creationOpId };
 }

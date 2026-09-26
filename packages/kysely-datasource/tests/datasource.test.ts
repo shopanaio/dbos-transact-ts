@@ -1,3 +1,4 @@
+import { withTestSystemDatabase } from '../../../tests/system-database-factory';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { Client, Pool } from 'pg';
 import { KyselyDataSource } from '..';
@@ -28,7 +29,7 @@ describe('KyselyDataSource', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'kysely-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'kysely-ds-test' }));
     await DBOS.launch();
   });
 
@@ -548,7 +549,7 @@ describe('KyselyDataSourceCreateTxCompletion', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'kysely-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'kysely-ds-test' }));
     await DBOS.launch();
   });
 
@@ -584,7 +585,7 @@ describe('KyselyDataSourceWithCustomKysely', () => {
 
   beforeAll(async () => {
     await createDatabases(userDB, true);
-    DBOS.setConfig({ name: 'kysely-ds-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'kysely-ds-test' }));
   });
 
   afterAll(async () => {

@@ -1,3 +1,4 @@
+import { withTestSystemDatabase } from '../../../tests/system-database-factory';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { Client, Pool } from 'pg';
 import { DrizzleDataSource } from '..';
@@ -84,7 +85,7 @@ describe('DrizzleDataSource with custom Pool', () => {
   });
 
   beforeEach(async () => {
-    DBOS.setConfig({ name: 'drizzle-pool-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'drizzle-pool-test' }));
     await DBOS.launch();
   });
 
@@ -126,7 +127,7 @@ describe('DrizzleDataSource with custom Pool', () => {
     const { rows } = await customPool.query<{ val: number }>('SELECT 1 as val');
     expect(rows[0].val).toBe(1);
     // Re-launch so the afterEach shutdown doesn't fail
-    DBOS.setConfig({ name: 'drizzle-pool-test' });
+    DBOS.setConfig(await withTestSystemDatabase({ name: 'drizzle-pool-test' }));
     await DBOS.launch();
   });
 });

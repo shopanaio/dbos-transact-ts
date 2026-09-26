@@ -1,3 +1,5 @@
+import { PostgresSystemDatabase } from '../src/system_database';
+import { withTestClientDatabase } from './system-database-factory';
 import { randomUUID } from 'node:crypto';
 import { DBOS, Debouncer, DBOSConfig, StatusString, DBOSClient, DebouncerClient } from '../src';
 import { DBOSExecutor } from '../src/dbos-executor';
@@ -46,7 +48,7 @@ describe('debouncer-tests', () => {
 
   // The dedup ID a debounce computes for `workflow` and a given key.
   const dedupIDForKey = (key: string) => `.debouncerWorkflow-${key}`;
-  const getSysDB = () => DBOSExecutor.globalInstance!.systemDatabase;
+  const getSysDB = () => DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
   const portableWorkflow = DBOS.registerWorkflow(
     async (x: number) => {
@@ -328,7 +330,9 @@ describe('debouncer-tests', () => {
     const shortDebouncePeriodMs = 1000;
 
     // Set a huge period but small timeout, verify workflows start after the timeout
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     const debouncer1 = new DebouncerClient(client, {
       workflowName: 'debouncerWorkflow',
       debounceTimeoutMs: 2000,
@@ -399,7 +403,9 @@ describe('debouncer-tests', () => {
     assert.equal(await thirdHandle.getResult(), fourthValue);
     assert.equal(await fourthHandle.getResult(), fourthValue);
 
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     const clientDebouncer = new DebouncerClient(client, {
       workflowClassName: 'TestClass',
       workflowName: 'exampleWorkflow',
@@ -610,7 +616,9 @@ describe('debouncer-tests', () => {
     // A DebouncerClient given serializationType 'portable' must write portable-format inputs on
     // both the fresh enqueue and the bounce, so a portable-registered workflow stays readable
     // across languages.
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       const debouncer = new DebouncerClient(client, {
         workflowName: 'debouncerPortableWorkflow',
@@ -681,7 +689,9 @@ describe('debouncer-tests', () => {
     // No conflicting option left a workflow behind.
     expect((await DBOS.listWorkflows({ workflowName: 'debouncerWorkflow' })).length).toBe(0);
 
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       // Client: the same four options are rejected.
       const dedupClient = new DebouncerClient(client, {
@@ -772,7 +782,9 @@ describe('debouncer-tests', () => {
   test('test-debounce-key-collision-between-workflows', async () => {
     // Regression test: "colw"+"b-k" and "colw-b"+"k" both yield dedup ID ".colw-b-k".
     // The collider must surface the conflict, not overwrite the other workflow's row.
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       const debouncerA = new DebouncerClient(client, { workflowName: 'colw' });
       const debouncerB = new DebouncerClient(client, { workflowName: 'colw-b' });
@@ -803,14 +815,14 @@ describe('debouncer-tests', () => {
 
   test('test-debounce-ownership-across-applications', async () => {
     // A debounce key held by another application is a conflict, not a race to retry, which would spin.
-    const holder = await DBOSClient.create({
+    const holder = await withTestClientDatabase({
       systemDatabaseUrl: config.systemDatabaseUrl!,
       applicationName: 'debounce-app-one',
-    });
-    const other = await DBOSClient.create({
+    }).then((options) => DBOSClient.create(options));
+    const other = await withTestClientDatabase({
       systemDatabaseUrl: config.systemDatabaseUrl!,
       applicationName: 'debounce-app-two',
-    });
+    }).then((options) => DBOSClient.create(options));
     try {
       const debouncerOne = new DebouncerClient(holder, { workflowName: 'crossapp' });
       const debouncerTwo = new DebouncerClient(other, { workflowName: 'crossapp' });
@@ -838,10 +850,10 @@ describe('debouncer-tests', () => {
 
   test('test-debounce-targets-another-application', async () => {
     // Both debouncers can act for a named application: same-target bounces coalesce, a different target collides.
-    const client = await DBOSClient.create({
+    const client = await withTestClientDatabase({
       systemDatabaseUrl: config.systemDatabaseUrl!,
       applicationName: 'app-a',
-    });
+    }).then((options) => DBOSClient.create(options));
     try {
       const ownerOf = async (workflowID: string) => {
         const status = await getSysDB().getWorkflowStatus(workflowID);

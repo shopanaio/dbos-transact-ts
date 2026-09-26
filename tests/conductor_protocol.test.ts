@@ -1,3 +1,4 @@
+import { PostgresSystemDatabase } from '../src/system_database';
 import { inspect } from 'node:util';
 import { AddressInfo } from 'node:net';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -238,7 +239,7 @@ describe('conductor-live-connection', () => {
   });
 
   test('skips a round while the previous one on this executor is still running', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const logger = DBOSExecutor.globalInstance!.logger;
     await expect(retentionWorkflow(1)).resolves.toBe(1);
 

@@ -103,7 +103,12 @@ class StreamReadCheckpointer {
       return noRecordedValue;
     }
     const workflowID = this.#ctx!.workflowId!;
-    const recorded = await this.sysdb.getOperationResultAndThrowIfCancelled(workflowID, functionID);
+    const ctx = this.#ctx!;
+    const cached = ctx.prefetchedOperationResults && functionID <= (ctx.prefetchedMaxFunctionId ?? -1);
+    if (cached) await this.sysdb.checkIfCanceledLimited(workflowID);
+    const recorded = cached
+      ? ctx.prefetchedOperationResults!.get(functionID)
+      : await this.sysdb.getOperationResultAndThrowIfCancelled(workflowID, functionID);
     if (recorded === undefined) {
       this.#replaying = false;
       return noRecordedValue;

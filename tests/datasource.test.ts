@@ -1,3 +1,4 @@
+import { PostgresSystemDatabase } from '../src/system_database';
 import { randomUUID } from 'node:crypto';
 import { Client, Pool, PoolConfig } from 'pg';
 import knex, { Knex } from 'knex';
@@ -605,7 +606,7 @@ async function raceTransaction(): Promise<string> {
   }
 
   if (probeState.claimSysdb) {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const winnerMs = winnerEpochMs();
     await sysdb.recordOperationResult(workflowID, stepID, 'raceTransaction', false, winnerMs, winnerMs, {
       output: DBOSJSON.stringify(WINNER_TX_OUTPUT),
@@ -665,7 +666,7 @@ describe('datasource-duplicate-execution', () => {
     expect((await DBOS.getWorkflowStatus(wfid))?.status).toBe('SUCCESS');
   });
 
-  test('a losing duplicate execution parks when the winner also owns the checkpoint', async () => {
+  test('[postgres-only] a losing duplicate execution parks when the winner also owns the checkpoint', async () => {
     const wfid = randomUUID();
     probeState.claimSysdb = true;
 

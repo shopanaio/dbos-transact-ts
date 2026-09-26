@@ -1,6 +1,6 @@
 import { DBOS } from '../src';
 import { DBOSConfig } from '../src/dbos-executor';
-import { dropDatabase, generateDBOSTestConfig, reexecuteWorkflowById, setUpDBOSTestSysDb } from './helpers';
+import { resetTestSysDb, generateDBOSTestConfig, reexecuteWorkflowById, setUpDBOSTestSysDb } from './helpers';
 import { randomUUID } from 'node:crypto';
 
 describe('oaoo-tests', () => {
@@ -17,8 +17,7 @@ describe('oaoo-tests', () => {
   });
 
   beforeEach(async () => {
-    expect(config.systemDatabaseUrl).toBeDefined();
-    await dropDatabase(config.systemDatabaseUrl!);
+    await resetTestSysDb(config);
     await DBOS.launch();
   });
 

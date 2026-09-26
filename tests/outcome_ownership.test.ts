@@ -1,3 +1,4 @@
+import { PostgresSystemDatabase } from '../src/system_database';
 import { randomUUID } from 'node:crypto';
 import { Client } from 'pg';
 
@@ -266,7 +267,11 @@ describe('workflow-outcome-ownership', () => {
     // that the run parked, rather than merely that it had not gotten around to
     // the write yet.
     await retryUntilSuccess(() => {
-      expect(DBOSExecutor.globalInstance!.systemDatabase.checkForRunningWorkflow(handle.workflowID)).toBe(false);
+      expect(
+        (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).checkForRunningWorkflow(
+          handle.workflowID,
+        ),
+      ).toBe(false);
     }, 30000);
 
     // The run must wait for the owning execution.
@@ -374,7 +379,11 @@ describe('workflow-outcome-ownership', () => {
 
     // The parked run must not hold the running-workflow entry.
     await retryUntilSuccess(() => {
-      expect(DBOSExecutor.globalInstance!.systemDatabase.checkForRunningWorkflow(handle.workflowID)).toBe(false);
+      expect(
+        (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).checkForRunningWorkflow(
+          handle.workflowID,
+        ),
+      ).toBe(false);
     }, 30000);
     const parked = await Promise.race([resultPromise.then(() => false), sleepms(2000).then(() => true)]);
     expect(parked).toBe(true);

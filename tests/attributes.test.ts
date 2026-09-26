@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { randomUUID } from 'crypto';
 import { DBOS, DBOSClient, Debouncer } from '../src';
 import { DBOSConfig } from '../src/dbos-executor';
@@ -118,7 +119,7 @@ describe('workflow-attributes', () => {
     ).rejects.toThrow(/no JSON-serializable properties/);
 
     // The client enqueue path validates too.
-    const client = await DBOSClient.create({ systemDatabaseUrl });
+    const client = await withTestClientDatabase({ systemDatabaseUrl }).then((options) => DBOSClient.create(options));
     try {
       await expect(
         client.enqueue({
@@ -153,7 +154,7 @@ describe('workflow-attributes', () => {
   });
 
   test('client enqueue records attributes', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl });
+    const client = await withTestClientDatabase({ systemDatabaseUrl }).then((options) => DBOSClient.create(options));
     try {
       // Enqueue to a queue nothing consumes; the workflow stays ENQUEUED, which is
       // enough to check the attributes recorded at creation.

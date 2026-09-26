@@ -1,6 +1,8 @@
+import { PostgresSystemDatabase } from '../src/system_database';
+import { withTestClientDatabase } from './system-database-factory';
 import { DBOS, ConfiguredInstance, DBOSClient } from '../src';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
-import { generateDBOSTestConfig, setUpDBOSTestSysDb, dropDatabase } from './helpers';
+import { generateDBOSTestConfig, setUpDBOSTestSysDb, resetTestSysDb } from './helpers';
 import { sleepms } from '../src/utils';
 
 describe('dynamic-scheduler-tests', () => {
@@ -13,8 +15,7 @@ describe('dynamic-scheduler-tests', () => {
     config.systemDatabasePoolSize = 20;
     await setUpDBOSTestSysDb(config);
     DBOS.setConfig(config);
-    expect(config.systemDatabaseUrl).toBeDefined();
-    await dropDatabase(config.systemDatabaseUrl!);
+    await resetTestSysDb(config);
   });
 
   beforeEach(async () => {
@@ -273,7 +274,10 @@ describe('dynamic-scheduler-tests', () => {
     // Simulate runtime state: the user pauses it and the scheduler records a firing.
     await DBOS.pauseSchedule('preserve-sched');
     const firedAt = new Date('2020-01-01T00:00:00.000Z').toISOString();
-    await DBOSExecutor.globalInstance!.systemDatabase.updateLastFiredAt('preserve-sched', firedAt);
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).updateLastFiredAt(
+      'preserve-sched',
+      firedAt,
+    );
 
     // Re-apply the same schedule with a changed definition.
     await DBOS.applySchedules([
@@ -418,7 +422,10 @@ describe('dynamic-scheduler-tests', () => {
     // Simulate runtime state the caller doesn't own.
     await DBOS.pauseSchedule('update-sched');
     const firedAt = new Date('2020-01-01T00:00:00.000Z').toISOString();
-    await DBOSExecutor.globalInstance!.systemDatabase.updateLastFiredAt('update-sched', firedAt);
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).updateLastFiredAt(
+      'update-sched',
+      firedAt,
+    );
     const originalId = (await DBOS.getSchedule('update-sched'))!.scheduleId;
 
     // Update only the cadence and context.
@@ -951,7 +958,7 @@ describe('dynamic-scheduler-tests', () => {
     expect(original!.scheduleName).toBe('export-test');
 
     // Export, delete, then reimport: scheduleName must survive the round-trip.
-    const sysDb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysDb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const exported = await sysDb.exportWorkflow(workflowID, true);
     await DBOS.deleteWorkflow(workflowID);
     expect(await DBOS.listWorkflows({ workflowIDs: [workflowID] })).toEqual([]);
@@ -1171,7 +1178,7 @@ describe('dynamic-scheduler-tests', () => {
     // Set lastFiredAt to 3 hours ago, simulating that the scheduler was down
     const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
     threeHoursAgo.setMinutes(0, 0, 0);
-    await DBOSExecutor.globalInstance!.systemDatabase.updateLastFiredAt(
+    await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).updateLastFiredAt(
       'backfill-restart',
       threeHoursAgo.toISOString(),
     );
@@ -1273,7 +1280,9 @@ describe('dynamic-scheduler-tests', () => {
   // ---------------------------------------------------------------------------
 
   test('test_client_schedule_crud', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       await client.createSchedule({
         scheduleName: 'client-test',
@@ -1372,7 +1381,9 @@ describe('dynamic-scheduler-tests', () => {
   });
 
   test('test_client_apply_schedules', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       await client.applySchedules([
         { scheduleName: 'csched-a', workflowName: 'myWorkflow', schedule: '* * * * *', context: { region: 'us' } },
@@ -1439,7 +1450,9 @@ describe('dynamic-scheduler-tests', () => {
     clientTriggerResults.dates = [];
     clientTriggerResults.contexts = [];
 
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       await client.createSchedule({
         scheduleName: 'client-trigger',
@@ -1474,7 +1487,9 @@ describe('dynamic-scheduler-tests', () => {
     clientBackfillResults.dates = [];
     clientBackfillResults.contexts = [];
 
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       await client.createSchedule({
         scheduleName: 'client-backfill',
@@ -1513,7 +1528,9 @@ describe('dynamic-scheduler-tests', () => {
   });
 
   test('test_client_pause_resume_schedule', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       await client.createSchedule({
         scheduleName: 'client-pause',

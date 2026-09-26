@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { StatusString, WorkflowHandle, DBOS, ConfiguredInstance, DBOSClient } from '../src';
 import { DBOSConfig, DBOSExecutor, DBOS_QUEUE_MAX_PRIORITY, DBOS_QUEUE_MIN_PRIORITY } from '../src/dbos-executor';
 import {
@@ -18,7 +19,7 @@ import {
   retryUntilSuccess,
   setWfAndChildrenToPending,
 } from './helpers';
-import { EnqueueOptions, QueueRecord, SystemDatabase } from '../src/system_database';
+import { EnqueueOptions, QueueRecord, PostgresSystemDatabase } from '../src/system_database';
 import { randomUUID } from 'node:crypto';
 import { globalParams, sleepms, INTERNAL_QUEUE_NAME } from '../src/utils';
 
@@ -34,6 +35,7 @@ import {
   DBOSAwaitedWorkflowCancelledError,
   QueueDedupIDDuplicated,
   getDBOSErrorCode,
+  SystemDatabaseContentionError,
 } from '../src/error';
 
 const execFileAsync = promisify(execFile);
@@ -796,7 +798,9 @@ describe('queued-wf-tests-simple', () => {
 
   test('test-concurrency-across-versions', async () => {
     expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
 
     const other_version = 'other_version';
     const other_version_handle = await client.enqueue({
@@ -818,8 +822,10 @@ describe('queued-wf-tests-simple', () => {
 
   test('test-versionless-dequeue-requires-latest-version', async () => {
     expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const workerVersion = globalParams.appVersion;
 
     // Register a newer application version so this worker is no longer the latest.
@@ -1972,7 +1978,9 @@ describe('queue-time-outs', () => {
 
     // Confirm client enqueue works with partitions
     expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       const clientHandle = await client.enqueue({
         queueName: partitionQueue.name,
@@ -2194,7 +2202,9 @@ describe('delay-tests', () => {
 
     // Test via client enqueue
     expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       const tClientBefore = Date.now();
       const clientHandle = await client.enqueue({
@@ -2360,9 +2370,9 @@ describe('database-backed-queue-crud', () => {
     await DBOS.shutdown();
   });
 
-  test('register-retrieve-delete-and-conflict-resolution', async () => {
+  test('[postgres-only] register-retrieve-delete-and-conflict-resolution', async () => {
     const queueName = `test_crud_queue_${randomUUID()}`;
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // The columns behind the removed priorityEnabled/partitionQueue options are still written.
     const storedFlags = async () => {
       const { rows } = await sysdb.pool.query<{ priority_enabled: boolean; partition_queue: boolean }>(
@@ -2449,9 +2459,9 @@ describe('database-backed-queue-crud', () => {
     await DBOS.deleteQueue(queueName);
   });
 
-  test('dynamic-config-via-setters', async () => {
+  test('[postgres-only] dynamic-config-via-setters', async () => {
     const queueName = `test_dyn_queue_${randomUUID()}`;
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const storedPartitionFlag = async (name: string) => {
       const { rows } = await sysdb.pool.query<{ partition_queue: boolean }>(
         `SELECT partition_queue FROM "${sysdb.schemaName}".queues WHERE name = $1`,
@@ -2648,7 +2658,9 @@ describe('database-backed-queue-crud', () => {
     const idleName = `idle_${randomUUID()}`;
 
     const cfg = generateDBOSTestConfig();
-    const client = await DBOSClient.create({ systemDatabaseUrl: cfg.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: cfg.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     await client.registerQueue(listenedName, { minPollingIntervalMs: 100 });
     await client.registerQueue(idleName, { concurrency: 2, minPollingIntervalMs: 100 });
     await client.destroy();
@@ -3327,9 +3339,9 @@ describe('bounded-lane dispatcher', () => {
 });
 
 // These drive the sweep by hand against unpolled queues (`listenQueues: []` dispatches nothing), so each sweep's exact result set is observable.
-describe('partitioned-batch-dequeue', () => {
+describe('[postgres-only] partitioned-batch-dequeue', () => {
   let config: DBOSConfig;
-  let sysdb: SystemDatabase;
+  let sysdb: PostgresSystemDatabase;
 
   const batchWorkflow = DBOS.registerWorkflow(async (value: string) => Promise.resolve(value), {
     name: 'partitionBatchWorkflow',
@@ -3343,7 +3355,7 @@ describe('partitioned-batch-dequeue', () => {
   beforeEach(async () => {
     DBOS.setConfig({ ...config, listenQueues: [] });
     await DBOS.launch();
-    sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
   });
 
   afterEach(async () => {
@@ -3426,7 +3438,7 @@ describe('partitioned-batch-dequeue', () => {
     expect(await sweep(queue)).toEqual([ids['p1'][1]]);
   });
 
-  test('breaks (priority, created_at) ties by workflow_uuid', async () => {
+  test('[postgres-only] breaks (priority, created_at) ties by workflow_uuid', async () => {
     const queueName = `unpolled-tie-${randomUUID()}`;
     const queue = await registerBatchQueue(queueName);
     const ids = await enqueuePartitionRows(queueName, 'tie', ['p0'], 3);
@@ -3472,7 +3484,7 @@ describe('partitioned-batch-dequeue', () => {
     expect(await sweep(queue)).toEqual([ids['p0'][1]]);
   });
 
-  test('never co-admits into a partition when two workers sweep concurrently', async () => {
+  test('[postgres-only] never co-admits into a partition when two workers sweep concurrently', async () => {
     const queueName = `unpolled-race-${randomUUID()}`;
     const queue = await registerBatchQueue(queueName);
     const partitions = ['p0', 'p1', 'p2', 'p3'];
@@ -3498,7 +3510,7 @@ describe('partitioned-batch-dequeue', () => {
     });
   });
 
-  test('dequeues only rows eligible for this worker app version', async () => {
+  test('[postgres-only] dequeues only rows eligible for this worker app version', async () => {
     const queueName = `unpolled-ver-${randomUUID()}`;
     const queue = await registerBatchQueue(queueName);
     const ids = await enqueuePartitionRows(queueName, 'ver', ['p0', 'p1'], 3);
@@ -3578,7 +3590,7 @@ describe('partitioned-batch-dequeue-dispatch', () => {
 
   // Both are per-partition-concurrency-1 queues, so only the limiter / the pause excludes them.
   test('routes unsupported partitioned configurations away from the batched sweep', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const batchedQueues: string[] = [];
     const sweptQueues: string[] = [];
     const realBatched = sysdb.findAndMarkStartablePartitionedWorkflows.bind(sysdb);
@@ -3638,7 +3650,7 @@ describe('partitioned-batch-dequeue-dispatch', () => {
 
   // Every other batched-path test calls the sweep directly, so this is what pins the dispatch itself.
   test('runs one workflow at a time per partition, in FIFO order', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const batchedQueues: string[] = [];
     const realBatched = sysdb.findAndMarkStartablePartitionedWorkflows.bind(sysdb);
     jest.spyOn(sysdb, 'findAndMarkStartablePartitionedWorkflows').mockImplementation((queue, ...rest) => {
@@ -3737,7 +3749,7 @@ describe('dequeue-dispatch-cost', () => {
   });
 
   test('dispatch-does-not-upsert-workflow-status', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const initSpy = jest.spyOn(sysdb, 'initWorkflowStatus');
 
     const count = 20;
@@ -3774,7 +3786,7 @@ describe('dequeue-dispatch-cost', () => {
   }, 30000);
 
   test('status-fetch-chunks-and-retries-per-chunk', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // Started off-queue so the dispatcher never fetches these rows itself.
     const handles: WorkflowHandle<number>[] = [];
     for (let i = 0; i < 5; i++) {
@@ -3831,7 +3843,7 @@ describe('dequeue-dispatch-cost', () => {
   }, 30000);
 
   test('batch-status-fetch-failure-falls-back-to-single-reads', async () => {
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // Every batch fetch fails, so each claim is only dispatchable via its own re-read.
     jest
       .spyOn(sysdb, 'getWorkflowStatuses')
@@ -3849,9 +3861,9 @@ describe('dequeue-dispatch-cost', () => {
   }, 30000);
 });
 
-describe('limiter-dequeue-locking', () => {
+describe('[postgres-only] limiter-dequeue-locking', () => {
   let config: DBOSConfig;
-  let sysdb: SystemDatabase;
+  let sysdb: PostgresSystemDatabase;
 
   const limitedWorkflow = DBOS.registerWorkflow(async (value: string) => Promise.resolve(value), {
     name: 'limiterLockWorkflow',
@@ -3866,7 +3878,7 @@ describe('limiter-dequeue-locking', () => {
     // No lane polls these queues, so the rows stay ENQUEUED until this test claims them itself.
     DBOS.setConfig({ ...config, listenQueues: [] });
     await DBOS.launch();
-    sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
   });
 
   afterEach(async () => {
@@ -3887,7 +3899,7 @@ describe('limiter-dequeue-locking', () => {
     return Number(rows[0].count);
   }
 
-  test('a peer mid-claim blocks a rate-limited dequeue rather than being skipped past', async () => {
+  test('[postgres-only] a peer mid-claim blocks a rate-limited dequeue rather than being skipped past', async () => {
     const limit = 2;
     const queueName = `limiter-lock-${randomUUID()}`;
     const queue = await DBOS.registerQueue(queueName, {
@@ -3922,7 +3934,7 @@ describe('limiter-dequeue-locking', () => {
       // Under SKIP LOCKED this claims the rows behind the peer, spending the same budget a second time.
       await expect(
         sysdb.findAndMarkStartableWorkflows(queue, 'lock-test', globalParams.appVersion, undefined),
-      ).rejects.toMatchObject({ code: '55P03' });
+      ).rejects.toMatchObject({ name: 'SystemDatabaseContentionError', cause: { code: '55P03' } });
 
       // Nothing was admitted behind the peer's back.
       for (const id of ids) {
@@ -4088,7 +4100,9 @@ describe('partition-queue-limits', () => {
   test('rejects a queue name under the prefix reserved for DBOS', async () => {
     await expect(DBOS.registerQueue('_dbos_my_queue')).rejects.toThrow('is reserved');
     await expect(DBOS.registerQueue(INTERNAL_QUEUE_NAME, { concurrency: 5 })).rejects.toThrow('is reserved');
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       await expect(client.registerQueue('_dbos_client_queue')).rejects.toThrow('is reserved');
     } finally {
@@ -4218,15 +4232,15 @@ describe('partition-queue-limits', () => {
     }
 
     // Fail the first partition this queue sweeps, as a peer winning the claim race would.
-    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const realSingle = sysdb.findAndMarkStartableWorkflows.bind(sysdb);
     let poisoned = false;
     jest.spyOn(sysdb, 'findAndMarkStartableWorkflows').mockImplementation((queue, ...rest) => {
       if (queue.name === queueName && !poisoned) {
         poisoned = true;
-        const err = new Error('could not obtain lock on row in relation "workflow_status"') as NodeJS.ErrnoException;
-        err.code = '55P03';
-        return Promise.reject(err);
+        return Promise.reject(
+          new SystemDatabaseContentionError('could not obtain lock on row in relation "workflow_status"'),
+        );
       }
       return realSingle(queue, ...rest);
     });

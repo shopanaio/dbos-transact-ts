@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { DBOS, DBOSClient } from '../src';
 import { generateDBOSTestConfig } from './helpers';
 import { Client } from 'pg';
@@ -154,10 +155,10 @@ describe('custom-schema-tests', () => {
       expect(dbosWorkflows[0].status).toBe('SUCCESS');
 
       // Verify DBOSClient can query the custom schema
-      const client = await DBOSClient.create({
+      const client = await withTestClientDatabase({
         systemDatabaseUrl: dbUrl.toString(),
         systemDatabaseSchemaName: customSchemaName,
-      });
+      }).then((options) => DBOSClient.create(options));
 
       try {
         const clientWorkflows = await client.listWorkflows({ workflowName: 'testWorkflow' });

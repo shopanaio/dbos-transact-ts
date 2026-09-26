@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { randomUUID } from 'crypto';
 import { DBOS, DBOSClient, StatusString } from '../src';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
@@ -286,9 +287,9 @@ describe('test-app-version', () => {
     await DBOS.launch();
 
     // Create a client and test version API
-    const client = await DBOSClient.create({
+    const client = await withTestClientDatabase({
       systemDatabaseUrl: config.systemDatabaseUrl!,
-    });
+    }).then((options) => DBOSClient.create(options));
     try {
       const versions = await client.listApplicationVersions();
       expect(versions.length).toBeGreaterThanOrEqual(1);

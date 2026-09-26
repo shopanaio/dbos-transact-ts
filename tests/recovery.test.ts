@@ -1,3 +1,4 @@
+import { PostgresSystemDatabase } from '../src/system_database';
 import { DBOS } from '../src/';
 import {
   generateDBOSTestConfig,
@@ -243,7 +244,7 @@ describe('recovery-tests', () => {
   });
 
   test('dead-letter-spares-a-row-given-a-fresh-budget', async () => {
-    const sysDB = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysDB = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const handle = await DBOS.startWorkflow(LocalRecovery).deadLetterWorkflow();
     await handle.getResult();
 
@@ -280,7 +281,7 @@ describe('recovery-tests', () => {
 
   test('recovery-reenqueue-is-ownership-conditional', async () => {
     // Recovery only re-enqueues workflows still owned by an executor it declared dead, so a duplicate or delayed sweep for that executor cannot yank back a workflow a live executor has since claimed.
-    const sysDB = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysDB = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     BlockedRecovery.startCount = 0;
     BlockedRecovery.blocker.clear();
     const handle = await DBOS.startWorkflow(BlockedRecovery).blockedWorkflow('bob');

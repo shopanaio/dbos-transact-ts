@@ -4,6 +4,7 @@ module.exports = {
   transform: {
     '^.+\\.tsx?$': ['ts-jest', { diagnostics: { ignoreCodes: [151002] } }],
   },
+  ...(process.env.DBOS_TEST_SYSTEM_DATABASE_FACTORY ? { testNamePattern: '^(?!.*\\[postgres-only\\])' } : {}),
   testEnvironment: 'node',
   testRegex: '((\\.|/)(test|spec))\\.(ts|js)?$',
   testPathIgnorePatterns: ['packages/*', 'tests/bundler-test/node_modules', 'tests/bundler-test/dist'],

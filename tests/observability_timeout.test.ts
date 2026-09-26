@@ -1,15 +1,16 @@
+import { withTestClientDatabase } from './system-database-factory';
 import { Client, PoolClient } from 'pg';
 import { DBOS, DBOSClient, DBOSConfig } from '../src';
 import { translateDbosConfig } from '../src/config';
 import { DBOSExecutor } from '../src/dbos-executor';
 import { DBOSQueryTimeoutError } from '../src/error';
 import { DBOSJSON, DBOSSerializer } from '../src/serialization';
-import { SystemDatabase } from '../src/system_database';
+import { PostgresSystemDatabase } from '../src/system_database';
 import { GlobalLogger } from '../src/telemetry/logs';
 import { getClientConfig } from '../src/utils';
 import { generateDBOSTestConfig, setUpDBOSTestSysDb } from './helpers';
 
-describe('observability-query-timeout', () => {
+describe('[postgres-only] observability-query-timeout', () => {
   let config: DBOSConfig;
   let systemDatabaseUrl: string;
 
@@ -24,8 +25,8 @@ describe('observability-query-timeout', () => {
     observabilityQueryTimeoutMs?: number,
     poolSize: number = 2,
     serializer: DBOSSerializer = DBOSJSON,
-  ): SystemDatabase {
-    return new SystemDatabase(
+  ): PostgresSystemDatabase {
+    return new PostgresSystemDatabase(
       systemDatabaseUrl,
       new GlobalLogger(),
       serializer,
@@ -41,7 +42,7 @@ describe('observability-query-timeout', () => {
   }
 
   /** Every statement this handle issues, from the connect event on, so nothing predates the listener. */
-  function captureStatements(sysdb: SystemDatabase, statements: string[] = []): string[] {
+  function captureStatements(sysdb: PostgresSystemDatabase, statements: string[] = []): string[] {
     sysdb.pool.on('connect', (client: PoolClient) => {
       const query = client.query.bind(client);
       client.query = ((...args: Parameters<typeof query>) => {
@@ -57,7 +58,7 @@ describe('observability-query-timeout', () => {
 
   /** The capped transaction, reached the way the repo's other tests reach soft-private internals. */
   type Capped = { observabilityQuery<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> };
-  const capped = (sysdb: SystemDatabase) => sysdb as unknown as Capped;
+  const capped = (sysdb: PostgresSystemDatabase) => sysdb as unknown as Capped;
 
   const show = async (client: PoolClient, setting: string) =>
     (await client.query<Record<string, string>>(`SHOW ${setting}`)).rows[0][setting];
@@ -66,7 +67,7 @@ describe('observability-query-timeout', () => {
     name: 'observabilityTimeoutWorkflow',
   });
 
-  test('observability queries carry a statement timeout', async () => {
+  test('[postgres-only] observability queries carry a statement timeout', async () => {
     const sysdb = makeSysDb();
     const statements = captureStatements(sysdb);
     try {
@@ -77,7 +78,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('every observability query sets the timeout', async () => {
+  test('[postgres-only] every observability query sets the timeout', async () => {
     const sysdb = makeSysDb();
     const statements = captureStatements(sysdb);
     const workflowID = 'no-such-workflow';
@@ -107,7 +108,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('an ID-keyed workflow lookup is not capped', async () => {
+  test('[postgres-only] an ID-keyed workflow lookup is not capped', async () => {
     const sysdb = makeSysDb();
     const statements = captureStatements(sysdb);
     try {
@@ -119,7 +120,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('the statement timeout does not outlive its transaction', async () => {
+  test('[postgres-only] the statement timeout does not outlive its transaction', async () => {
     // A one-connection pool, so the next query is guaranteed the same session.
     const sysdb = makeSysDb(undefined, 1);
     try {
@@ -146,7 +147,7 @@ describe('observability-query-timeout', () => {
     }
   }
 
-  test('the statement timeout cancels a blocked query', async () => {
+  test('[postgres-only] the statement timeout cancels a blocked query', async () => {
     const sysdb = makeSysDb(300);
     try {
       const error = await whileWorkflowStatusIsLocked(() => sysdb.listWorkflows({}).catch((e: unknown) => e));
@@ -160,7 +161,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('a timed-out query under @dbRetry rejects instead of retrying forever', async () => {
+  test('[postgres-only] a timed-out query under @dbRetry rejects instead of retrying forever', async () => {
     const sysdb = makeSysDb(300);
     const start = new Date(0).toISOString();
     const end = new Date(Date.now() + 3_600_000).toISOString();
@@ -172,7 +173,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('a capped query runs under the cap, at read committed', async () => {
+  test('[postgres-only] a capped query runs under the cap, at read committed', async () => {
     const sysdb = makeSysDb();
     try {
       const settings = await capped(sysdb).observabilityQuery(async (client) => ({
@@ -185,7 +186,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('a non-timeout failure inside a capped query propagates unchanged', async () => {
+  test('[postgres-only] a non-timeout failure inside a capped query propagates unchanged', async () => {
     const sysdb = makeSysDb();
     try {
       const error = await capped(sysdb)
@@ -198,7 +199,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('a failed BEGIN does not return a poisoned client to the pool', async () => {
+  test('[postgres-only] a failed BEGIN does not return a poisoned client to the pool', async () => {
     // A one-connection pool, so the next query is guaranteed the same session.
     const sysdb = makeSysDb(undefined, 1);
     try {
@@ -216,7 +217,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('deserialization runs after the transaction commits', async () => {
+  test('[postgres-only] deserialization runs after the transaction commits', async () => {
     // node-postgres keeps the portal's snapshot alive until commit, so parsing inside would extend the hold the cap bounds.
     const log: string[] = [];
     const recording: DBOSSerializer = {
@@ -259,7 +260,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('the statement timeout can be disabled', async () => {
+  test('[postgres-only] the statement timeout can be disabled', async () => {
     const sysdb = makeSysDb(0);
     const statements = captureStatements(sysdb);
     try {
@@ -271,7 +272,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('a sub-millisecond statement timeout still caps', async () => {
+  test('[postgres-only] a sub-millisecond statement timeout still caps', async () => {
     // Rounding down to 0 would hand back no timeout at all, the loosest cap rather than the tightest.
     const sysdb = makeSysDb(0.4);
     try {
@@ -281,7 +282,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('a non-finite statement timeout is rejected', () => {
+  test('[postgres-only] a non-finite statement timeout is rejected', () => {
     for (const bad of [NaN, Infinity]) {
       expect(() => translateDbosConfig({ ...config, observabilityQueryTimeoutMs: bad })).toThrow(
         'observabilityQueryTimeoutMs',
@@ -290,7 +291,7 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('an out-of-range statement timeout is rejected', async () => {
+  test('[postgres-only] an out-of-range statement timeout is rejected', async () => {
     for (const bad of [2_147_483_648, 1e21]) {
       expect(() => translateDbosConfig({ ...config, observabilityQueryTimeoutMs: bad })).toThrow(
         'observabilityQueryTimeoutMs',
@@ -307,11 +308,11 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('a configured statement timeout reaches the system database', async () => {
+  test('[postgres-only] a configured statement timeout reaches the system database', async () => {
     DBOS.setConfig({ ...config, observabilityQueryTimeoutMs: 5000 });
     await DBOS.launch();
     try {
-      const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+      const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
       expect(sysdb.observabilityQueryTimeoutMs).toBe(5000);
 
       // The timeout must not disturb a query that finishes inside it.
@@ -324,10 +325,12 @@ describe('observability-query-timeout', () => {
     }
   });
 
-  test('a client statement timeout reaches the system database', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl, observabilityQueryTimeoutMs: 5000 });
+  test('[postgres-only] a client statement timeout reaches the system database', async () => {
+    const client = await withTestClientDatabase({ systemDatabaseUrl, observabilityQueryTimeoutMs: 5000 }).then(
+      (options) => DBOSClient.create(options),
+    );
     try {
-      const sysdb = (client as unknown as { systemDatabase: SystemDatabase }).systemDatabase;
+      const sysdb = (client as unknown as { systemDatabase: PostgresSystemDatabase }).systemDatabase;
       expect(sysdb.observabilityQueryTimeoutMs).toBe(5000);
       await expect(client.listWorkflows({})).resolves.toBeDefined();
     } finally {

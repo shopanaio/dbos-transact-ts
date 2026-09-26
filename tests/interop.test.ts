@@ -1,3 +1,4 @@
+import { withTestClientDatabase } from './system-database-factory';
 /**
  * Cross-language interoperability tests for portable workflow serialization.
  *
@@ -140,7 +141,9 @@ describe('interop-tests', () => {
   // --------------------------------------------------------------------------
 
   test('test-interop-canonical', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     try {
       // Start the canonical workflow
       const wfh = await client.enqueuePortable(

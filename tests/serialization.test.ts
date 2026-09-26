@@ -1,3 +1,5 @@
+import { PostgresSystemDatabase } from '../src/system_database';
+import { withTestClientDatabase } from './system-database-factory';
 import { Client } from 'pg';
 import { DBOS, DBOSClient, DBOSConfig, DBOSSerializer, WorkflowHandle } from '../src';
 import { generateDBOSTestConfig, reexecuteWorkflowById, setUpDBOSTestSysDb } from './helpers';
@@ -521,7 +523,7 @@ describe('portable-serialization-tests', () => {
     await checkStreamSer(wfhp.workflowID, 'pstream', DBOSPortableJSON.name());
 
     // Test copy+paste workflow
-    const sysDb = DBOSExecutor.globalInstance!.systemDatabase;
+    const sysDb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // Export with children
     const exported = await sysDb.exportWorkflow(wfhp.workflowID, true);
 
@@ -935,7 +937,9 @@ describe('portable-serialization-tests', () => {
   });
 
   test('test-portable-client', async () => {
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
     const queueName = 'test-portable-client-queue';
     try {
       await client.registerQueue(queueName);
@@ -1092,10 +1096,10 @@ describe('custom-serializer-restart-tests', () => {
     await expect(DBOS.retrieveWorkflow(p1ErrHandle.workflowID).getResult()).rejects.toThrow('phase1-oops');
 
     // Old data should also be readable via DBOSClient with the custom serializer
-    const client = await DBOSClient.create({
+    const client = await withTestClientDatabase({
       systemDatabaseUrl: config.systemDatabaseUrl!,
       serializer: base64Serializer,
-    });
+    }).then((options) => DBOSClient.create(options));
     expect(await client.retrieveWorkflow(p1Handle.workflowID).getResult()).toBe('result:hello');
     expect(await client.getEvent(p1Handle.workflowID, 'key')).toBe('hello');
 
@@ -1185,7 +1189,9 @@ describe('custom-serializer-restart-tests', () => {
     await expect(DBOS.retrieveWorkflow(custErrHandle.workflowID).getResult()).rejects.toThrow('is not available');
 
     // DBOSClient without the serializer should behave equivalently
-    const client = await DBOSClient.create({ systemDatabaseUrl: config.systemDatabaseUrl! });
+    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
+      DBOSClient.create(options),
+    );
 
     // Default-format data readable via client too
     expect(await client.retrieveWorkflow(defaultWfId).getResult()).toBe('result:default');
@@ -1411,10 +1417,10 @@ describe('async-serializer-tests', () => {
     await DBOS.launch();
     await DBOS.registerQueue('async-client-q', { onConflict: 'always_update' });
 
-    const client = await DBOSClient.create({
+    const client = await withTestClientDatabase({
       systemDatabaseUrl: config.systemDatabaseUrl!,
       serializer: asyncBase64Serializer,
-    });
+    }).then((options) => DBOSClient.create(options));
     try {
       // client.send + workflow.recv: covers serializeValue on the client path.
       const receiver = await DBOS.startWorkflow(asyncRecvWorkflow)();

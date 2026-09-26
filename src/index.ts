@@ -55,3 +55,27 @@ export { VersionInfo, ApplicationRowCounts } from './system_database';
 export { EnqueueWorkflowOptions } from './enqueue_options';
 
 export { QueueControlError, type QueueControlState } from './system_database';
+
+export type {
+  SystemDatabase,
+  SystemDatabaseFactory,
+  SystemDatabaseContext,
+  SystemTransaction,
+  SystemDatabaseStoredResult,
+  WorkflowStatusInternal,
+  WaitPollingKind,
+} from './system_database';
+export { PostgresSystemDatabase } from './system_database';
+export { SystemDatabaseLocalState, NotificationMap } from './system_database_local_state';
+export { SystemDatabaseDuplicateKeyError, SystemDatabaseContentionError } from './error';
+export type {
+  WorkflowScheduleInternal,
+  WorkflowScheduleUpdate,
+  QueueRecord,
+  QueueRecordUpdate,
+  QueueReadinessRequest,
+  DebounceParams,
+  DebounceResult,
+  ExportedWorkflow,
+} from './system_database';
+export { getSystemDatabaseExecutionContext } from './context';

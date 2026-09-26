@@ -250,3 +250,23 @@ export function getDBOSErrorCode(e: Error): number | undefined {
   }
   return undefined;
 }
+
+/** Создание fork/import поверх уже существующего идентификатора. */
+export class SystemDatabaseDuplicateKeyError extends DBOSError {
+  /** `cause` — исходная ошибка backend-а. */
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message);
+    this.name = 'SystemDatabaseDuplicateKeyError';
+    if (options?.cause !== undefined) this.cause = options.cause;
+  }
+}
+
+/** Конфликт claim или фонового обслуживания, допускающий повтор runner-ом. */
+export class SystemDatabaseContentionError extends DBOSError {
+  /** `cause` — исходная ошибка backend-а. */
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message);
+    this.name = 'SystemDatabaseContentionError';
+    if (options?.cause !== undefined) this.cause = options.cause;
+  }
+}

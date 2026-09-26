@@ -1,3 +1,5 @@
+import { SystemDatabaseDuplicateKeyError, SystemDatabaseContentionError } from './error';
+import { SystemDatabaseLocalState } from './system_database_local_state';
 import { DBOSExecutor } from './dbos-executor';
 import { DatabaseError, Pool, PoolClient, Notification, Client, PoolConfig, ClientBase } from 'pg';
 import {
@@ -177,7 +179,10 @@ export interface QueueControlState {
 }
 
 export class QueueControlError extends Error {
-  constructor(public readonly code: 'QUEUE_NOT_FOUND' | 'INTERNAL_QUEUE' | 'QUEUE_OWNER_MISMATCH', name: string) {
+  constructor(
+    public readonly code: 'QUEUE_NOT_FOUND' | 'INTERNAL_QUEUE' | 'QUEUE_OWNER_MISMATCH',
+    name: string,
+  ) {
     super(`${code}: ${name}`);
     this.name = 'QueueControlError';
   }
@@ -321,6 +326,7 @@ export interface GetStepAggregatesInput {
 
 // For internal use, not serialized status.
 export interface WorkflowStatusInternal {
+  creationOpId?: string;
   workflowUUID: string;
   status: string;
   workflowName: string;
@@ -584,38 +590,6 @@ export async function verifySystemDatabase(
     logger.debug(`System database schema version ${currentVersion} satisfies the required version ${requiredVersion}`);
   } finally {
     await releaseSystemDatabaseClient(client, customPool);
-  }
-}
-
-class NotificationMap<T> {
-  map: Map<string, Map<number, (event?: T) => void>> = new Map();
-  curCK: number = 0;
-
-  registerCallback(key: string, cb: (event?: T) => void) {
-    if (!this.map.has(key)) {
-      this.map.set(key, new Map());
-    }
-    const ck = this.curCK++;
-    this.map.get(key)!.set(ck, cb);
-    return { key, ck };
-  }
-
-  deregisterCallback(k: { key: string; ck: number }) {
-    if (!this.map.has(k.key)) return;
-    const sm = this.map.get(k.key)!;
-    if (!sm.has(k.ck)) return;
-    sm.delete(k.ck);
-    if (sm.size === 0) {
-      this.map.delete(k.key);
-    }
-  }
-
-  callCallbacks(key: string, event?: T) {
-    if (!this.map.has(key)) return;
-    const sm = this.map.get(key)!;
-    for (const cb of sm.values()) {
-      cb(event);
-    }
   }
 }
 
@@ -911,6 +885,30 @@ function dbRetry(
   };
 }
 
+function systemDatabaseError(kind: 'duplicate' | 'contention') {
+  return function <T extends (...args: never[]) => Promise<unknown>>(
+    _target: unknown,
+    _name: string,
+    descriptor: TypedPropertyDescriptor<T>,
+  ): TypedPropertyDescriptor<T> {
+    const method = descriptor.value!;
+    descriptor.value = async function (this: never, ...args: never[]) {
+      try {
+        return await method.apply(this, args);
+      } catch (error) {
+        const code = (error as { code?: string } | null)?.code;
+        const message = error instanceof Error ? error.message : String(error);
+        if (kind === 'duplicate' && code === '23505')
+          throw new SystemDatabaseDuplicateKeyError(message, { cause: error });
+        if (kind === 'contention' && (code === '40001' || code === '55P03'))
+          throw new SystemDatabaseContentionError(message, { cause: error });
+        throw error;
+      }
+    } as T;
+    return descriptor;
+  };
+}
+
 /**
  * General notes:
  *   The responsibilities of the `SystemDatabase` are to store data for workflows, and
@@ -922,7 +920,314 @@ function dbRetry(
  *     the serialization process of turning data into JSON or converting it back, should
  *     be done elsewhere (executor), as it may require application-specific logic or extensions.
  */
-export class SystemDatabase {
+
+/** Непрозрачный контекст атомарной мутации; создаётся только backend-ом. */
+declare const systemTransactionBrand: unique symbol;
+export interface SystemTransaction {
+  readonly [systemTransactionBrand]: true;
+}
+
+export interface SystemDatabaseContext {
+  logger: GlobalLogger;
+  serializer: DBOSSerializer;
+  appName?: string;
+  executorId: string;
+  appVersion: string;
+  role: 'executor' | 'client';
+  observabilityQueryTimeoutMs?: number;
+  pollingConcurrency?: number;
+}
+export type WaitPollingKind = 'result' | 'event' | 'stream';
+export type SystemDatabaseFactory = (ctx: SystemDatabaseContext) => SystemDatabase;
+
+export interface SystemDatabase extends Pick<SystemDatabaseLocalState, keyof SystemDatabaseLocalState> {
+  readonly serializer: DBOSSerializer;
+  readonly appName?: string;
+  readonly logger: GlobalLogger;
+  /**
+   * Интервал опроса ожидания вида `kind`. `requested` — публичный `pollingIntervalMs` вызова.
+   * PostgreSQL использует его как есть, а без него — свой интервал по умолчанию; backend со
+   * страховочным интервалом ограничивает им `requested` сверху.
+   */
+  resolveWaitPollingIntervalMs(kind: WaitPollingKind, requested?: number): number;
+  prefetchOperationResults(workflowID: string): Promise<Map<number, SystemDatabaseStoredResult>>;
+  init(runMigrations?: boolean): Promise<void>;
+  destroy(): Promise<void>;
+  initWorkflowStatus(
+    initStatus: WorkflowStatusInternal,
+    ownerXid: string | null,
+    client?: SystemTransaction,
+  ): Promise<{
+    status: string;
+    creationOpId?: string;
+    shouldExecuteOnThisExecutor: boolean;
+    deadlineEpochMS?: number;
+    serialization: SysDBSerializationFormat | null;
+  }>;
+  deadLetterWorkflows(workflowIDs: string[], minRecoveryAttempts: number): Promise<void>;
+  enqueueWorkflows(statuses: WorkflowStatusInternal[]): Promise<Set<string>>;
+  recordWorkflowOutput(workflowID: string, status: WorkflowStatusInternal): Promise<boolean>;
+  recordWorkflowError(workflowID: string, status: WorkflowStatusInternal): Promise<boolean>;
+  getPendingWorkflows(executorID: string, appVersion: string): Promise<GetPendingWorkflowsOutput[]>;
+  reenqueueWorkflowsForRecovery(executorID: string, appVersion: string, recoveryQueueName: string): Promise<string[]>;
+  getWorkflowStatus(workflowID: string, callerID?: string, callerFN?: number): Promise<WorkflowStatusInternal | null>;
+  getWorkflowStatuses(workflowIDs: string[]): Promise<Map<string, WorkflowStatusInternal>>;
+  setWorkflowStatus(
+    workflowID: string,
+    status: (typeof StatusString)[keyof typeof StatusString],
+    resetRecoveryAttempts: boolean,
+    internalOptions?: {
+      updateName?: string;
+      queueName?: string;
+      resetStartedAtEpochMs?: boolean;
+    },
+  ): Promise<void>;
+  getOperationResultAndThrowIfCancelled(
+    workflowID: string,
+    functionID: number,
+  ): Promise<SystemDatabaseStoredResult | undefined>;
+  getAllOperationResults(workflowID: string, limit?: number, offset?: number): Promise<operation_outputs[]>;
+  recordOperationResult(
+    workflowID: string,
+    functionID: number,
+    functionName: string,
+    checkConflict: boolean,
+    startTimeEpochMs: number,
+    endTimeEpochMs: number,
+    options?: {
+      childWorkflowID?: string | null;
+      output?: string | null;
+      error?: string | null;
+      serialization?: string | null;
+    },
+  ): Promise<void>;
+  runSystemMutationStep(
+    workflowID: string,
+    functionID: number,
+    functionName: string,
+    callback: (client: SystemTransaction) => Promise<string | null>,
+  ): Promise<SystemDatabaseStoredResult | { output: string | null }>;
+  checkPatch(
+    workflowID: string,
+    functionID: number,
+    patchName: string,
+    deprecated: boolean,
+  ): Promise<{ isPatched: boolean; hasEntry: boolean }>;
+  cancelWorkflows(workflowIDs: string[], cancelChildren?: boolean): Promise<void>;
+  checkIfCanceled(workflowID: string): Promise<void>;
+  resumeWorkflows(workflowIDs: string[], queueName?: string): Promise<void>;
+  setWorkflowPriority(workflowID: string, priority: number): Promise<void>;
+  setWorkflowDelay(workflowID: string, delayUntilEpochMS: number): Promise<void>;
+  debounceDelayedWorkflow(params: DebounceParams, client?: SystemTransaction): Promise<DebounceResult>;
+  getWorkflowChildren(workflowID: string): Promise<string[]>;
+  deleteWorkflows(workflowIDs: string[], deleteChildren?: boolean): Promise<void>;
+  forkWorkflow(
+    workflowID: string,
+    startStep: number,
+    options?: {
+      newWorkflowID?: string;
+      applicationVersion?: string;
+      timeoutMS?: number;
+      queueName?: string;
+      queuePartitionKey?: string;
+      replacementChildren?: Record<string, string>;
+    },
+  ): Promise<string>;
+  forkFromFailure(
+    workflowIDs: string[],
+    options?: {
+      applicationVersion?: string;
+      queueName?: string;
+      queuePartitionKey?: string;
+      fromLastFailure?: boolean;
+      fromLastStep?: boolean;
+      fromStep?: number;
+      fromStepName?: string;
+    },
+  ): Promise<string[]>;
+  exportWorkflow(workflowID: string, exportChildren?: boolean): Promise<ExportedWorkflow[]>;
+  importWorkflow(workflows: ExportedWorkflow[]): Promise<void>;
+  checkIfCanceledLimited(workflowID: string): Promise<void>;
+  awaitWorkflowResult(
+    workflowID: string,
+    timeoutSeconds?: number,
+    callerID?: string,
+    timerFuncID?: number,
+    pollingIntervalMs?: number,
+    failIfMissing?: boolean,
+  ): Promise<SystemDatabaseStoredResult | undefined>;
+  awaitFirstWorkflowId(workflowIds: string[], callerID?: string, pollingIntervalMs?: number): Promise<string>;
+  awaitWorkflowIds(workflowIds: string[], callerID?: string, pollingIntervalMs?: number): Promise<void>;
+  durableSleepms(workflowID: string, functionID: number, durationMS: number): Promise<void>;
+  send(
+    workflowID: string,
+    functionID: number,
+    destinationID: string,
+    message: string | null,
+    topic: string | undefined,
+    serialization: string | null,
+    idempotencyKey?: string,
+  ): Promise<void>;
+  sendDirect(
+    destinationID: string,
+    message: string | null,
+    topic: string | undefined,
+    serialization: string | null,
+    idempotencyKey?: string,
+    client?: SystemTransaction,
+  ): Promise<void>;
+  recv(
+    workflowID: string,
+    functionID: number,
+    timeoutFunctionID: number,
+    topic?: string,
+    timeoutSeconds?: number,
+    pollingIntervalMs?: number,
+  ): Promise<{ serializedValue: string | null; serialization: string | null }>;
+  setEvent(
+    workflowID: string,
+    functionID: number,
+    key: string,
+    message: string | null,
+    serialization: string | null,
+  ): Promise<void>;
+  getEvent(
+    workflowID: string,
+    key: string,
+    timeoutSeconds: number,
+    callerWorkflow?: {
+      workflowID: string;
+      functionID: number;
+      timeoutFunctionID: number;
+    },
+    pollingIntervalMs?: number,
+  ): Promise<{ serializedValue: string | null; serialization: string | null }>;
+  writeStreamFromStep(
+    workflowID: string,
+    functionID: number,
+    key: string,
+    serializedValue: string,
+    serialization: string | null,
+  ): Promise<void>;
+  writeStreamFromWorkflow(
+    workflowID: string,
+    functionID: number,
+    key: string,
+    serializedValue: string,
+    serialization: string | null,
+    functionName: string,
+  ): Promise<void>;
+  closeStreamFromWorkflow(workflowID: string, functionID: number, key: string): Promise<void>;
+  closeStreamFromStep(workflowID: string, stepID: number, key: string): Promise<void>;
+  readStreamValue(
+    workflowID: string,
+    key: string,
+    offset: number,
+  ): Promise<{ status: string | null; value: { serializedValue: string; serialization: string | null } | undefined }>;
+  getAllEvents(workflowID: string): Promise<Record<string, unknown>>;
+  getAllNotifications(
+    workflowID: string,
+  ): Promise<{ topic: string | null; message: unknown; createdAtEpochMs: number; consumed: boolean }[]>;
+  getAllStreamEntries(workflowID: string): Promise<Record<string, unknown[]>>;
+  transitionDelayedWorkflows(): Promise<void>;
+  getDeduplicatedWorkflow(queueName: string, deduplicationID: string): Promise<string | null>;
+  getQueuePartitions(queueName: string): Promise<string[]>;
+  findAndMarkStartableWorkflows(
+    queue: WorkflowQueue,
+    executorID: string,
+    appVersion: string,
+    queuePartitionKey?: string,
+    localRunningCount?: number,
+    partitionLocalRunningCount?: number,
+  ): Promise<string[]>;
+  findAndMarkStartablePartitionedWorkflows(
+    queue: WorkflowQueue,
+    executorID: string,
+    appVersion: string,
+    maxTasks?: number,
+  ): Promise<string[]>;
+  listWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatusInternal[]>;
+  getWorkflowAggregates(input: GetWorkflowAggregatesInput): Promise<WorkflowAggregateRow[]>;
+  getStepAggregates(input: GetStepAggregatesInput): Promise<StepAggregateRow[]>;
+  acquireRetentionLock(): Promise<{ release: () => Promise<void> } | undefined>;
+  garbageCollectPayloads(cutoff: number, batchSize?: number): Promise<number[]>;
+  garbageCollect(
+    cutoffEpochTimestampMs?: number | null,
+    rowsThreshold?: number | null,
+    options?: { batchSize?: number | null },
+  ): Promise<number | undefined>;
+  listTimedOutWorkflowIds(cutoffEpochTimestampMs: number): Promise<string[]>;
+  getMetrics(startTime: string, endTime: string, applicationName?: string[]): Promise<MetricData[]>;
+  createSchedule(schedule: WorkflowScheduleInternal, client?: SystemTransaction): Promise<void>;
+  listSchedules(
+    filters?: {
+      status?: string | string[];
+      workflowName?: string | string[];
+      scheduleNamePrefix?: string | string[];
+      applicationName?: string | string[];
+    },
+    client?: SystemTransaction,
+  ): Promise<WorkflowScheduleInternal[]>;
+  getSchedule(name: string, client?: SystemTransaction): Promise<WorkflowScheduleInternal | null>;
+  deleteSchedule(name: string, client?: SystemTransaction): Promise<void>;
+  setScheduleStatus(name: string, status: string, client?: SystemTransaction): Promise<void>;
+  updateSchedule(name: string, updates: WorkflowScheduleUpdate, client?: SystemTransaction): Promise<void>;
+  updateLastFiredAt(name: string, lastFiredAt: string): Promise<void>;
+  applySchedules(schedules: WorkflowScheduleInternal[]): Promise<void>;
+  createApplicationVersion(versionName: string, applicationName?: string): Promise<void>;
+  updateApplicationVersionTimestamp(versionName: string, newTimestamp: number, applicationName?: string): Promise<void>;
+  listApplicationVersions(): Promise<VersionInfo[]>;
+  getLatestApplicationVersion(applicationName?: string): Promise<VersionInfo>;
+  getQueueControlState(name: string): Promise<QueueControlState>;
+  setQueuePaused(name: string, paused: boolean): Promise<QueueControlState>;
+  findQueuesWithEnqueuedWorkflows(
+    requests: QueueReadinessRequest[],
+    appVersion: string,
+  ): Promise<QueueReadinessRequest[]>;
+  getQueue(name: string): Promise<QueueRecord | null>;
+  listQueues(applicationName?: string | string[], names?: string[]): Promise<QueueRecord[]>;
+  deleteQueue(name: string): Promise<void>;
+  updateQueue(name: string, fields: QueueRecordUpdate): Promise<void>;
+  upsertQueue(record: QueueRecord, updateExisting: boolean): Promise<boolean>;
+  renameApplication(
+    oldName: string | undefined,
+    newName: string,
+    options?: { batchSize?: number | null; adoptUnclaimedRows?: boolean },
+  ): Promise<ApplicationRowCounts>;
+}
+
+export class PostgresSystemDatabase extends SystemDatabaseLocalState implements SystemDatabase {
+  private readonly transactions = new WeakMap<SystemTransaction, PoolClient>();
+
+  private transactionClient(tx: SystemTransaction): PoolClient {
+    const client = this.transactions.get(tx);
+    if (!client) throw new DBOSError('Invalid or expired system transaction');
+    return client;
+  }
+
+  resolveWaitPollingIntervalMs(kind: WaitPollingKind, requested?: number): number {
+    if (requested !== undefined) return requested;
+    if (kind === 'result') return this.dbPollingIntervalResultMs;
+    return kind === 'event' ? this.dbPollingIntervalEventMs : this.dbPollingIntervalStreamMs;
+  }
+
+  @dbRetry()
+  async prefetchOperationResults(workflowID: string): Promise<Map<number, SystemDatabaseStoredResult>> {
+    const rows = await this.getAllOperationResults(workflowID);
+    return new Map(
+      rows.map((row) => [
+        row.function_id,
+        {
+          output: row.output,
+          error: row.error,
+          childWorkflowID: row.child_workflow_id,
+          functionName: row.function_name,
+          serialization: row.serialization,
+        },
+      ]),
+    );
+  }
+
   // ==================== Lifecycle ====================
   readonly pool: Pool;
   readonly schemaName: string;
@@ -951,9 +1256,6 @@ export class SystemDatabase {
   dbPollingIntervalStreamMs: number = 1000;
   shouldUseDBNotifications: boolean = true;
   queueControlNotificationsEnabled: boolean = true;
-  readonly notificationsMap: NotificationMap<void> = new NotificationMap();
-  readonly workflowEventsMap: NotificationMap<void> = new NotificationMap();
-  readonly streamsMap: NotificationMap<void> = new NotificationMap();
   customPool: boolean = false;
 
   // Interval for coalescing LISTEN/NOTIFY notifications pushed off the write path (Postgres + L/N only).
@@ -973,12 +1275,7 @@ export class SystemDatabase {
    * concurrently against the pool, so a polling storm cannot check out every
    * client and starve control-plane operations. See {@link #pollWithLimiter}.
    */
-  readonly pollLimiter: Semaphore;
-
-  readonly runningWorkflowMap: Map<
-    string,
-    { promise: Promise<unknown>; queueName?: string; queuePartitionKey?: string }
-  > = new Map(); // Map from workflowID to workflow promise, queue name and partition key
+  readonly pollLimiter: Semaphore; // Map from workflowID to workflow promise, queue name and partition key
 
   // Per-partition-key created_at cursors: keep per-key queue order monotonic across batches
   readonly #batchCreatedAtCursors: Map<string, number> = new Map();
@@ -1007,6 +1304,7 @@ export class SystemDatabase {
     readonly appName?: string,
     observabilityQueryTimeoutMs: number = DEFAULT_OBSERVABILITY_QUERY_TIMEOUT_MS,
   ) {
+    super(logger, () => this.#destroyed);
     this.schemaName = schemaName;
     this.shouldUseDBNotifications = useListenNotify;
     this.queueControlNotificationsEnabled = useListenNotify;
@@ -1237,13 +1535,14 @@ export class SystemDatabase {
   async initWorkflowStatus(
     initStatus: WorkflowStatusInternal,
     ownerXid: string | null,
-    client?: ClientBase,
+    tx?: SystemTransaction,
   ): Promise<{
     status: string;
     shouldExecuteOnThisExecutor: boolean;
     deadlineEpochMS?: number;
     serialization: SysDBSerializationFormat | null;
   }> {
+    const client = tx === undefined ? undefined : this.transactionClient(tx);
     if (client !== undefined) {
       return await this.#initWorkflowStatusInternal(client, initStatus, ownerXid);
     }
@@ -1784,13 +2083,15 @@ export class SystemDatabase {
     }
   }
 
-  async runTransactionalStep(
+  async runSystemMutationStep(
     workflowID: string,
     functionID: number,
     functionName: string,
-    callback: (client: PoolClient) => Promise<string | null>,
-  ): Promise<SystemDatabaseStoredResult | undefined> {
+    callback: (tx: SystemTransaction) => Promise<string | null>,
+  ): Promise<SystemDatabaseStoredResult | { output: string | null }> {
     const client = await this.#connect();
+    const tx = Object.freeze({}) as SystemTransaction;
+    this.transactions.set(tx, client);
     try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       const existing = await this.#getOperationResultAndThrowIfCancelled(client, workflowID, functionID);
@@ -1799,7 +2100,7 @@ export class SystemDatabase {
         return existing;
       }
       const startTime = Date.now();
-      const output = await callback(client);
+      const output = await callback(tx);
       await this.recordOperationResultInternal(
         client,
         workflowID,
@@ -1814,11 +2115,12 @@ export class SystemDatabase {
       );
       await client.query('COMMIT');
       await debugTriggerPoint(DEBUG_TRIGGER_STEP_COMMIT);
-      return undefined;
+      return { output };
     } catch (e) {
       await client.query('ROLLBACK');
       throw e;
     } finally {
+      this.transactions.delete(tx);
       client.release();
     }
   }
@@ -1919,7 +2221,14 @@ export class SystemDatabase {
            completed_at = NULL
        WHERE workflow_uuid = ANY($3)
          AND status NOT IN ($4, $5)`,
-      [StatusString.ENQUEUED, queueName ?? null, workflowIDs, StatusString.SUCCESS, StatusString.ERROR, INTERNAL_QUEUE_NAME],
+      [
+        StatusString.ENQUEUED,
+        queueName ?? null,
+        workflowIDs,
+        StatusString.SUCCESS,
+        StatusString.ERROR,
+        INTERNAL_QUEUE_NAME,
+      ],
     );
   }
 
@@ -1953,7 +2262,8 @@ export class SystemDatabase {
    * Runs on `client` if given, joining its transaction (e.g. a transactional step's);
    * otherwise in its own retried transaction.
    */
-  async debounceDelayedWorkflow(params: DebounceParams, client?: PoolClient): Promise<DebounceResult> {
+  async debounceDelayedWorkflow(params: DebounceParams, tx?: SystemTransaction): Promise<DebounceResult> {
+    const client = tx === undefined ? undefined : this.transactionClient(tx);
     if (client !== undefined) {
       return await this.#debounceDelayedWorkflowInternal(client, params);
     }
@@ -2110,6 +2420,7 @@ export class SystemDatabase {
     }
   }
 
+  @systemDatabaseError('duplicate')
   async forkWorkflow(
     workflowID: string,
     startStep: number,
@@ -2127,6 +2438,7 @@ export class SystemDatabase {
     return result[0];
   }
 
+  @systemDatabaseError('duplicate')
   async forkFromFailure(
     workflowIDs: string[],
     options: {
@@ -2517,6 +2829,7 @@ export class SystemDatabase {
     return exportedWorkflows;
   }
 
+  @systemDatabaseError('duplicate')
   async importWorkflow(workflows: ExportedWorkflow[]): Promise<void> {
     const client = await this.#connect();
     try {
@@ -2659,97 +2972,6 @@ export class SystemDatabase {
     }
   }
 
-  // ==================== Awaiting Workflows ====================
-  registerRunningWorkflow(
-    workflowID: string,
-    workflowPromise: Promise<unknown>,
-    onSettled: () => void,
-    queueName?: string,
-    queuePartitionKey?: string,
-  ) {
-    // Need to await for the workflow and capture errors.
-    const awaitWorkflowPromise = workflowPromise
-      .catch((error) => {
-        const outcome = this.#destroyed ? 'was abandoned by shutdown' : 'failed';
-        this.logger.debug(`Workflow ${workflowID} ${outcome}: ${error}`);
-      })
-      .finally(() => {
-        onSettled();
-      });
-    this.runningWorkflowMap.set(workflowID, {
-      promise: awaitWorkflowPromise,
-      queueName,
-      queuePartitionKey,
-    });
-  }
-
-  checkForRunningWorkflow(workflowID: string): boolean {
-    return this.runningWorkflowMap.has(workflowID);
-  }
-
-  clearRunningWorkflow(workflowID: string): void {
-    const queueName = this.runningWorkflowMap.get(workflowID)?.queueName;
-    this.runningWorkflowMap.delete(workflowID);
-    if (queueName) for (const listener of this.queueBudgetListeners) listener(queueName);
-  }
-
-  /** Workflows this worker is running for a queue, across every partition of it. */
-  countRunningWorkflowsForQueue(queueName: string): number {
-    let count = 0;
-    for (const entry of this.runningWorkflowMap.values()) {
-      if (entry.queueName === queueName) count++;
-    }
-    return count;
-  }
-
-  /** Workflows this worker is running for one partition of a queue. */
-  countRunningWorkflowsForPartition(queueName: string, queuePartitionKey?: string): number {
-    let count = 0;
-    for (const entry of this.runningWorkflowMap.values()) {
-      if (entry.queueName === queueName && entry.queuePartitionKey === queuePartitionKey) count++;
-    }
-    return count;
-  }
-
-  /** Wait up to `timeoutMS` for locally-running workflows to finish. Without a timeout, do not wait at all. */
-  async awaitRunningWorkflows(timeoutMS?: number): Promise<void> {
-    if (timeoutMS !== undefined && timeoutMS > 0) {
-      const deadline = Date.now() + timeoutMS;
-      if (this.runningWorkflowMap.size > 0) {
-        this.logger.info('Waiting for pending workflows to finish.');
-      }
-      // Each pass picks up workflows a draining workflow started, and awaits any given run only once.
-      const awaited = new Set<Promise<unknown>>();
-      for (;;) {
-        const pending = Array.from(this.runningWorkflowMap.values(), (entry) => entry.promise).filter(
-          (promise) => !awaited.has(promise),
-        );
-        if (pending.length === 0) break;
-        for (const promise of pending) awaited.add(promise);
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const timedOut = await Promise.race([
-          Promise.allSettled(pending).then(() => false),
-          new Promise<boolean>((resolve) => {
-            timer = setTimeout(() => resolve(true), Math.max(0, deadline - Date.now()));
-          }),
-        ]);
-        clearTimeout(timer);
-        if (timedOut) break;
-      }
-    }
-    if (this.runningWorkflowMap.size > 0) {
-      this.logger.warn(
-        `Shutting down while ${this.runningWorkflowMap.size} workflows are still running: ${Array.from(this.runningWorkflowMap.keys()).join(', ')}`,
-      );
-    }
-    if (this.workflowEventsMap.map.size > 0) {
-      this.logger.warn('Workflow events map is not empty - shutdown is not clean.');
-    }
-    if (this.notificationsMap.map.size > 0) {
-      this.logger.warn('Message notification map is not empty - shutdown is not clean.');
-    }
-  }
-
   /**
    * Run a DB-backed polling read under the polling concurrency limiter, so that
    * high-fan-out wait loops cannot check out every pool client and starve
@@ -2785,7 +3007,7 @@ export class SystemDatabase {
   ): Promise<SystemDatabaseStoredResult | undefined> {
     const timeoutms = timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined;
     let finishTime = timeoutms !== undefined ? Date.now() + timeoutms : undefined;
-    const pollIntervalMs = pollingIntervalMs ?? this.dbPollingIntervalResultMs;
+    const pollIntervalMs = this.resolveWaitPollingIntervalMs('result', pollingIntervalMs);
 
     // Record the durable timeout deadline once before polling. #durableSleep persists it on the
     // first call and reads back the same value on recovery, so it never changes across iterations.
@@ -2841,7 +3063,7 @@ export class SystemDatabase {
   @dbRetry()
   async awaitFirstWorkflowId(workflowIds: string[], callerID?: string, pollingIntervalMs?: number): Promise<string> {
     const placeholders = workflowIds.map((_, i) => `$${i + 1}`).join(', ');
-    const pollIntervalMs = pollingIntervalMs ?? this.dbPollingIntervalResultMs;
+    const pollIntervalMs = this.resolveWaitPollingIntervalMs('result', pollingIntervalMs);
 
     while (true) {
       if (callerID) await this.checkIfCanceledLimited(callerID);
@@ -2867,7 +3089,7 @@ export class SystemDatabase {
   @dbRetry()
   async awaitWorkflowIds(workflowIds: string[], callerID?: string, pollingIntervalMs?: number): Promise<void> {
     const remainingWorkflowIds = new Set(workflowIds);
-    const pollIntervalMs = pollingIntervalMs ?? this.dbPollingIntervalResultMs;
+    const pollIntervalMs = this.resolveWaitPollingIntervalMs('result', pollingIntervalMs);
 
     while (remainingWorkflowIds.size > 0) {
       const currentWorkflowIds = [...remainingWorkflowIds];
@@ -2950,14 +3172,30 @@ export class SystemDatabase {
   }
 
   /** Runs on `client` if given, joining its transaction; otherwise on the pool with retries. */
+  async enqueueInTransaction(status: WorkflowStatusInternal, client: ClientBase): Promise<void> {
+    await this.#initWorkflowStatusInternal(client, status, null);
+  }
+
+  async sendInTransaction(
+    destinationID: string,
+    message: string | null,
+    topic: string | undefined,
+    serialization: string | null,
+    idempotencyKey: string | undefined,
+    client: ClientBase,
+  ): Promise<void> {
+    await this.#sendDirectInternal(client, destinationID, message, topic, serialization, idempotencyKey);
+  }
+
   async sendDirect(
     destinationID: string,
     message: string | null,
     topic: string | undefined,
     serialization: string | null,
     idempotencyKey?: string,
-    client?: ClientBase,
+    tx?: SystemTransaction,
   ): Promise<void> {
+    const client = tx === undefined ? undefined : this.transactionClient(tx);
     if (client !== undefined) {
       return await this.#sendDirectInternal(client, destinationID, message, topic, serialization, idempotencyKey);
     }
@@ -3024,7 +3262,7 @@ export class SystemDatabase {
 
     const timeoutms = timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined;
     let finishTime = timeoutms !== undefined ? Date.now() + timeoutms : undefined;
-    const pollIntervalMs = pollingIntervalMs ?? this.dbPollingIntervalEventMs;
+    const pollIntervalMs = this.resolveWaitPollingIntervalMs('event', pollingIntervalMs);
 
     // Record the durable timeout deadline once before polling. #durableSleep persists it on the
     // first call and reads back the same value on recovery, so it never changes across iterations.
@@ -3216,7 +3454,7 @@ export class SystemDatabase {
     const payloadKey = `${workflowID}::${key}`;
     const timeoutms = timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined;
     let finishTime = timeoutms !== undefined ? Date.now() + timeoutms : undefined;
-    const pollIntervalMs = pollingIntervalMs ?? this.dbPollingIntervalEventMs;
+    const pollIntervalMs = this.resolveWaitPollingIntervalMs('event', pollingIntervalMs);
 
     // If we have a callerWorkflow, we want a durable sleep, otherwise, not. Record the durable
     // timeout deadline once before polling. #durableSleep persists it on the first call and reads
@@ -3591,6 +3829,7 @@ export class SystemDatabase {
 
   // ==================== Queues ====================
 
+  @systemDatabaseError('contention')
   async transitionDelayedWorkflows(): Promise<void> {
     // Transition workflows from DELAYED to ENQUEUED when their delay has expired.
     // For debounced workflows, clear the deduplication ID in the same atomic update: it is a
@@ -3623,6 +3862,7 @@ export class SystemDatabase {
   }
 
   @dbRetry()
+  @systemDatabaseError('contention')
   async getQueuePartitions(queueName: string): Promise<string[]> {
     // Recursive-CTE loose index scan: SELECT DISTINCT would scan every ENQUEUED row, whereas each iteration here is one seek on idx_workflow_status_partition_dequeue_v3, so cost scales with the number of partitions rather than the backlog depth.
     const params: unknown[] = [queueName, StatusString.ENQUEUED];
@@ -3647,6 +3887,7 @@ export class SystemDatabase {
     return rows.map((row) => row.pk);
   }
 
+  @systemDatabaseError('contention')
   async findAndMarkStartableWorkflows(
     queue: WorkflowQueue,
     executorID: string,
@@ -3857,6 +4098,7 @@ export class SystemDatabase {
   partitionedDequeueSweepCap: number = 8192;
 
   /** Dequeue each partition's head-of-line workflow in one transaction, at most {@link partitionedDequeueSweepCap} per sweep; only valid for partition-concurrency-1 queues with no queue-wide limit. */
+  @systemDatabaseError('contention')
   async findAndMarkStartablePartitionedWorkflows(
     queue: WorkflowQueue,
     executorID: string,
@@ -4975,7 +5217,8 @@ export class SystemDatabase {
 
   // ==================== Scheduling ====================
 
-  async createSchedule(schedule: WorkflowScheduleInternal, client?: PoolClient): Promise<void> {
+  async createSchedule(schedule: WorkflowScheduleInternal, tx?: SystemTransaction): Promise<void> {
+    const client = tx === undefined ? undefined : this.transactionClient(tx);
     const q = client ?? this.pool;
     const owner = await this.#resolveRowOwner(
       q,
@@ -5024,8 +5267,9 @@ export class SystemDatabase {
       scheduleNamePrefix?: string | string[];
       applicationName?: string | string[];
     },
-    client?: PoolClient,
+    tx?: SystemTransaction,
   ): Promise<WorkflowScheduleInternal[]> {
+    const client = tx === undefined ? undefined : this.transactionClient(tx);
     const q = client ?? this.pool;
     const conditions: string[] = [];
     const params: unknown[] = [];
@@ -5072,7 +5316,8 @@ export class SystemDatabase {
     return result.rows.map((row: workflow_schedules) => mapWorkflowSchedule(row));
   }
 
-  async getSchedule(name: string, client?: PoolClient): Promise<WorkflowScheduleInternal | null> {
+  async getSchedule(name: string, tx?: SystemTransaction): Promise<WorkflowScheduleInternal | null> {
+    const client = tx === undefined ? undefined : this.transactionClient(tx);
     const q = client ?? this.pool;
     const result = await q.query(
       `SELECT ${SCHEDULE_COLUMNS}
@@ -5084,12 +5329,14 @@ export class SystemDatabase {
     return mapWorkflowSchedule(result.rows[0] as workflow_schedules);
   }
 
-  async deleteSchedule(name: string, client?: PoolClient): Promise<void> {
+  async deleteSchedule(name: string, tx?: SystemTransaction): Promise<void> {
+    const client = tx === undefined ? undefined : this.transactionClient(tx);
     const q = client ?? this.pool;
     await q.query(`DELETE FROM "${this.schemaName}".workflow_schedules WHERE schedule_name = $1`, [name]);
   }
 
-  async setScheduleStatus(name: string, status: string, client?: PoolClient): Promise<void> {
+  async setScheduleStatus(name: string, status: string, tx?: SystemTransaction): Promise<void> {
+    const client = tx === undefined ? undefined : this.transactionClient(tx);
     const q = client ?? this.pool;
     await q.query(`UPDATE "${this.schemaName}".workflow_schedules SET status = $1 WHERE schedule_name = $2`, [
       status,
@@ -5097,7 +5344,8 @@ export class SystemDatabase {
     ]);
   }
 
-  async updateSchedule(name: string, updates: WorkflowScheduleUpdate, client?: PoolClient): Promise<void> {
+  async updateSchedule(name: string, updates: WorkflowScheduleUpdate, tx?: SystemTransaction): Promise<void> {
+    const client = tx === undefined ? undefined : this.transactionClient(tx);
     const q = client ?? this.pool;
 
     // Only update the definition fields the caller provided, leaving runtime state (schedule_id, status, last_fired_at) untouched.
@@ -5332,11 +5580,6 @@ export class SystemDatabase {
     return mapVersionInfo(rows[0]);
   }
 
-  // ==================== Queues ====================
-
-  readonly queueControlListeners = new Set<(name?: string) => void>();
-  readonly queueBudgetListeners = new Set<(name: string) => void>();
-
   private validateControlRow(name: string, row?: queues): asserts row is queues {
     if (name.startsWith('_dbos_')) throw new QueueControlError('INTERNAL_QUEUE', name);
     if (!row) throw new QueueControlError('QUEUE_NOT_FOUND', name);
@@ -5347,7 +5590,9 @@ export class SystemDatabase {
 
   async getQueueControlState(name: string): Promise<QueueControlState> {
     const { rows } = await this.pool.query<queues>(
-      `SELECT ${QUEUE_COLUMNS} FROM "${this.schemaName}".queues WHERE name = $1`, [name]);
+      `SELECT ${QUEUE_COLUMNS} FROM "${this.schemaName}".queues WHERE name = $1`,
+      [name],
+    );
     this.validateControlRow(name, rows[0]);
     return { name, queueId: rows[0].queue_id, paused: rows[0].paused };
   }
@@ -5358,14 +5603,20 @@ export class SystemDatabase {
     try {
       await client.query('BEGIN');
       const { rows } = await client.query<queues>(
-        `SELECT ${QUEUE_COLUMNS} FROM "${this.schemaName}".queues WHERE name = $1 FOR UPDATE`, [name]);
+        `SELECT ${QUEUE_COLUMNS} FROM "${this.schemaName}".queues WHERE name = $1 FOR UPDATE`,
+        [name],
+      );
       this.validateControlRow(name, rows[0]);
       const row = rows[0];
       if (row.paused !== paused) {
-        await client.query(`UPDATE "${this.schemaName}".queues SET paused = $2 WHERE queue_id = $1 RETURNING paused`, [row.queue_id, paused]);
+        await client.query(`UPDATE "${this.schemaName}".queues SET paused = $2 WHERE queue_id = $1 RETURNING paused`, [
+          row.queue_id,
+          paused,
+        ]);
         if (this.queueControlNotificationsEnabled && !(await isCockroachDB(client))) {
           let payload = JSON.stringify({ schema: this.schemaName, queueId: row.queue_id, name });
-          if (Buffer.byteLength(payload) > 7000) payload = JSON.stringify({ schema: this.schemaName, queueId: row.queue_id });
+          if (Buffer.byteLength(payload) > 7000)
+            payload = JSON.stringify({ schema: this.schemaName, queueId: row.queue_id });
           await client.query('SELECT pg_notify($1, $2)', ['dbos_queue_control_channel', payload]);
         }
       }
@@ -5375,7 +5626,9 @@ export class SystemDatabase {
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw error;
-    } finally { client.release(); }
+    } finally {
+      client.release();
+    }
   }
 
   private async guardQueueClaim(client: PoolClient, queue: WorkflowQueue): Promise<void> {
@@ -5383,17 +5636,30 @@ export class SystemDatabase {
     const params: unknown[] = [queue.name, queue.queueId];
     const scope = this.#appNameFilter('application_name', this.appName, params);
     const { rows } = await client.query<{ paused: boolean }>(
-      `SELECT paused FROM "${this.schemaName}".queues WHERE name = $1 AND queue_id = $2 AND ${scope} FOR SHARE`, params);
+      `SELECT paused FROM "${this.schemaName}".queues WHERE name = $1 AND queue_id = $2 AND ${scope} FOR SHARE`,
+      params,
+    );
     if (!rows[0] || rows[0].paused) throw new QueueUnavailableError(queue.name);
   }
 
-  async findQueuesWithEnqueuedWorkflows(requests: QueueReadinessRequest[], appVersion: string): Promise<QueueReadinessRequest[]> {
+  @systemDatabaseError('contention')
+  async findQueuesWithEnqueuedWorkflows(
+    requests: QueueReadinessRequest[],
+    appVersion: string,
+  ): Promise<QueueReadinessRequest[]> {
     if (!requests.length) return [];
-    const params: unknown[] = [requests.map(r => r.name), requests.map(r => r.queueId), requests.map(r => r.generation), requests.map(r => r.internal), appVersion];
+    const params: unknown[] = [
+      requests.map((r) => r.name),
+      requests.map((r) => r.queueId),
+      requests.map((r) => r.generation),
+      requests.map((r) => r.internal),
+      appVersion,
+    ];
     const versions = this.#appNameFilter('application_name', this.appName, params);
     const workflows = this.#appNameFilter('w.application_name', this.appName, params);
     const queuesScope = this.#appNameFilter('q.application_name', this.appName, params);
-    const { rows } = await this.pool.query<QueueReadinessRequest>(`
+    const { rows } = await this.pool.query<QueueReadinessRequest>(
+      `
       WITH latest AS MATERIALIZED (
         SELECT version_name FROM "${this.schemaName}".application_versions
         WHERE ${versions} ORDER BY version_timestamp DESC LIMIT 1
@@ -5409,10 +5675,11 @@ export class SystemDatabase {
           AND (w.application_version = $5 OR (w.application_version IS NULL
             AND ((SELECT version_name FROM latest) IS NULL OR (SELECT version_name FROM latest) = $5)))
         LIMIT 1
-      )`, params);
+      )`,
+      params,
+    );
     return rows;
   }
-
 
   async getQueue(name: string): Promise<QueueRecord | null> {
     const { rows } = await this.pool.query<queues>(
@@ -6189,8 +6456,11 @@ export class SystemDatabase {
           if (msg.channel === 'dbos_queue_control_channel' && msg.payload) {
             try {
               const hint = JSON.parse(msg.payload) as { schema?: string; name?: string };
-              if (hint.schema === this.schemaName) for (const listener of this.queueControlListeners) listener(hint.name);
-            } catch { /* Invalid hints never change persisted state. */ }
+              if (hint.schema === this.schemaName)
+                for (const listener of this.queueControlListeners) listener(hint.name);
+            } catch {
+              /* Invalid hints never change persisted state. */
+            }
           } else if (msg.channel === DBOS_NOTIFICATIONS_CHANNEL && msg.payload) {
             this.notificationsMap.callCallbacks(msg.payload);
           } else if (msg.channel === DBOS_WORKFLOW_EVENTS_CHANNEL && msg.payload) {
