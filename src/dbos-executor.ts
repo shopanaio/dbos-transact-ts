@@ -865,7 +865,7 @@ export class DBOSExecutor {
               pendingAdopt = `Workflow ${workflowID} was cancelled during execution. Waiting for the recorded outcome`;
             } else {
               const e = new DBOSAwaitedWorkflowCancelledError(err.workflowID);
-              const { recorded } = await handleWorkflowError(e as Error, this);
+              const { recorded } = await handleWorkflowError(e, this);
               if (recorded) {
                 throw e;
               }
@@ -904,19 +904,18 @@ export class DBOSExecutor {
           workflowId: workflowID,
           creationOpId: ires.creationOpId,
           prefetchedOperationResults: undefined,
-          prefetchedMaxFunctionId: undefined,
         },
-        async () => {
-          let prefetched: Map<number, SystemDatabaseStoredResult>;
-          try {
-            prefetched = await this.systemDatabase.prefetchOperationResults(workflowID);
-          } catch (error) {
-            this.tracer.endSpan(span);
-            throw error;
-          }
-          const ctx = getCurrentContextStore()!;
-          ctx.prefetchedOperationResults = prefetched;
-          ctx.prefetchedMaxFunctionId = Array.from(prefetched.keys()).reduce((max, id) => Math.max(max, id), -1);
+        () => {
+          // Start the body synchronously, as without a prefetch: callers rely on it running before
+          // startWorkflow resolves, and a dequeued batch starts in claim (priority) order. The read
+          // is awaited by the first operation that needs a checkpoint, which reads the database anyway.
+          const prefetch = this.systemDatabase.prefetchOperationResults(workflowID).then((results) => ({
+            results,
+            maxFunctionId: Array.from(results.keys()).reduce((max, id) => Math.max(max, id), -1),
+          }));
+          // A failed read surfaces at that first operation; a body without one never observes it.
+          prefetch.catch(() => {});
+          getCurrentContextStore()!.prefetchedOperationResults = prefetch;
           return runWorkflow();
         },
       );
@@ -1187,15 +1186,15 @@ export class DBOSExecutor {
     functionID: number,
   ): Promise<{ result: SystemDatabaseStoredResult | undefined } | undefined> {
     const ctx = getCurrentContextStore();
-    if (
-      ctx?.workflowId !== workflowID ||
-      !ctx.prefetchedOperationResults ||
-      functionID > (ctx.prefetchedMaxFunctionId ?? -1)
-    ) {
+    if (ctx?.workflowId !== workflowID || !ctx.prefetchedOperationResults) {
+      return undefined;
+    }
+    const prefetched = await ctx.prefetchedOperationResults;
+    if (functionID > prefetched.maxFunctionId) {
       return undefined;
     }
     await this.systemDatabase.checkIfCanceledLimited(workflowID);
-    return { result: ctx.prefetchedOperationResults.get(functionID) };
+    return { result: prefetched.results.get(functionID) };
   }
 
   async getOperationResult(workflowID: string, functionID: number): Promise<SystemDatabaseStoredResult | undefined> {

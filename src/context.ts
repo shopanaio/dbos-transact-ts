@@ -27,11 +27,20 @@ export interface DBOSContextOptions {
   serializationType?: WorkflowSerializationFormat;
 }
 
+export interface PrefetchedOperationResults {
+  results: Map<number, SystemDatabaseStoredResult>;
+  /** Highest function ID with a checkpoint; later IDs are read from the system database. */
+  maxFunctionId: number;
+}
+
 export interface DBOSLocalCtx extends DBOSContextOptions {
   workflowId?: string;
   creationOpId?: string;
-  prefetchedOperationResults?: Map<number, SystemDatabaseStoredResult>;
-  prefetchedMaxFunctionId?: number;
+  /**
+   * Checkpoints read when the execution started. Pending while the body already runs: the body
+   * starts synchronously, and the first operation that needs a checkpoint awaits this.
+   */
+  prefetchedOperationResults?: Promise<PrefetchedOperationResults>;
   workflowQueueName?: string;
   curWFFunctionId?: number; // If currently in a WF, the current call number / ID
   activeStreamReads?: number; // Checkpointed stream reads that have reserved a step but not yet recorded it

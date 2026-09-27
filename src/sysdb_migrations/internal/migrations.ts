@@ -1135,7 +1135,7 @@ $$ LANGUAGE plpgsql;`,
     },
     {
       name: '121_queue_pause',
-      pg: [`ALTER TABLE "${schemaName}".queues ADD COLUMN paused BOOLEAN NOT NULL DEFAULT false`],
+      pg: [`ALTER TABLE "${schemaName}".queues ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT false`],
     },
   ];
 }

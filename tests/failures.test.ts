@@ -45,7 +45,12 @@ describe('failures-tests', () => {
     await expect(retrievedHandle.getStatus()).resolves.toMatchObject({
       status: StatusString.ERROR,
     });
-    await expect(retrievedHandle.getResult()).rejects.toThrow(new DBOSError('test dbos error with code.', 11));
+    // The recorded error is revived from its serialized form: the message and code survive, the
+    // DBOSError class does not, so match on those rather than on the instance.
+    await expect(retrievedHandle.getResult()).rejects.toMatchObject({
+      message: 'test dbos error with code.',
+      dbosErrorCode: 11,
+    });
 
     // Outside a workflow a step is a plain call, so the error arrives unwrapped and nothing is recorded.
     await expect(FailureTestClass.testStep()).rejects.toThrow(new DBOSError('test dbos error without code.'));

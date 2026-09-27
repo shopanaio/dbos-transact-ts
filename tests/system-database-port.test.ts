@@ -73,8 +73,7 @@ test('prefetch handles gaps and isolates child workflows while retaining cancell
     {
       workflowId: 'wf',
       creationOpId: 'generation',
-      prefetchedOperationResults: new Map([[2, checkpoint]]),
-      prefetchedMaxFunctionId: 2,
+      prefetchedOperationResults: Promise.resolve({ results: new Map([[2, checkpoint]]), maxFunctionId: 2 }),
     },
     async () => {
       expect(await executor.getOperationResult('wf', 2)).toBe(checkpoint);

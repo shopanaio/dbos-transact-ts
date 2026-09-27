@@ -35,7 +35,13 @@ export async function ensureTestDatabase(databaseUrl: string) {
   }
 }
 
-export function generateDBOSTestConfig(): DBOSConfig {
+/**
+ * PostgreSQL test config. It never carries a `systemDatabase` factory, and leaving the field out of
+ * its type keeps it assignable to the DBOSConfig of another SDK copy: scripts spawned under ts-node
+ * import DBOS from dist while this helper is typed against src, and the factory's context and
+ * branded SystemTransaction are nominal across copies.
+ */
+export function generateDBOSTestConfig(): Omit<DBOSConfig, 'systemDatabase'> {
   const dbPassword = process.env.DB_PASSWORD || process.env.PGPASSWORD || 'dbos';
   const url = new URL(
     process.env.DBOS_TEST_DB_URL ?? `postgresql://postgres:${dbPassword}@localhost:5432/dbostest?sslmode=disable`,
