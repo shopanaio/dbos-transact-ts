@@ -1,4 +1,5 @@
 import { withTestClientDatabase } from './system-database-factory';
+import { openWorkflowState } from './system-database-state';
 import { StatusString, WorkflowHandle, DBOS, ConfiguredInstance, DBOSClient } from '../src';
 import { DBOSConfig, DBOSExecutor, DBOS_QUEUE_MAX_PRIORITY, DBOS_QUEUE_MIN_PRIORITY } from '../src/dbos-executor';
 import {
@@ -199,17 +200,14 @@ describe('queued-wf-tests-simple', () => {
 
     // Workflows dequeued from a rate-limited queue must have rate_limited = TRUE,
     // so the partial idx_workflow_status_rate_limited index covers the count query.
-    const sysDbUrl = generateDBOSTestConfig().systemDatabaseUrl!;
-    const c = new Client({ connectionString: sysDbUrl });
-    await c.connect();
+    const state = await openWorkflowState(generateDBOSTestConfig());
     try {
-      const rl = await c.query<{ count: string }>(
-        `SELECT COUNT(*) FROM dbos.workflow_status WHERE queue_name = $1 AND rate_limited = TRUE`,
-        [rlqueue.name],
-      );
-      expect(Number(rl.rows[0].count)).toBe(qlimit * numWaves);
+      let rateLimited = 0;
+      for (const h of handles)
+        if ((await state.readStatusColumns(h.workflowID, ['rate_limited']))?.rate_limited === true) rateLimited++;
+      expect(rateLimited).toBe(qlimit * numWaves);
     } finally {
-      await c.end();
+      await state.close();
     }
   });
 
@@ -538,15 +536,9 @@ describe('queued-wf-tests-simple', () => {
     expect((await wfh3.getStatus())?.status).toBe(StatusString.ENQUEUED);
 
     // Manually update the database to pretend wf3 is PENDING and comes from a different executor
-    const systemDBClient = new Client({
-      connectionString: config.systemDatabaseUrl,
-    });
-    await systemDBClient.connect();
+    const state = await openWorkflowState(config);
     try {
-      await systemDBClient.query(
-        "UPDATE dbos.workflow_status SET executor_id = 'test-vmid-2', status = 'PENDING' WHERE workflow_uuid = $1",
-        [wfh3.workflowID],
-      );
+      await state.setExecutor(wfh3.workflowID, 'test-vmid-2', StatusString.PENDING);
 
       // Trigger workflow recovery. The two first workflows should still be blocked but the 3rd one enqueued
       const recovered_handles = await recoverPendingWorkflows(['test-vmid-2']);
@@ -577,14 +569,10 @@ describe('queued-wf-tests-simple', () => {
       expect(await wfh2.getResult()).toBeUndefined();
       expect(TestQueueRecovery.cnt).toBe(4);
 
-      const result = await systemDBClient.query(
-        'SELECT executor_id FROM dbos.workflow_status WHERE workflow_uuid = $1',
-        [wfh3.workflowID],
-      );
-      expect(result.rows).toEqual([{ executor_id: 'local' }]);
+      expect(await state.readExecutor(wfh3.workflowID)).toBe('local');
       expect(await queueEntriesAreCleanedUp()).toBe(true);
     } finally {
-      await systemDBClient.end();
+      await state.close();
     }
   });
 
@@ -797,9 +785,8 @@ describe('queued-wf-tests-simple', () => {
   }
 
   test('test-concurrency-across-versions', async () => {
-    expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
-      DBOSClient.create(options),
+    const client = await withTestClientDatabase({ systemDatabaseUrl: generateDBOSTestConfig().systemDatabaseUrl }).then(
+      (options) => DBOSClient.create(options),
     );
 
     const other_version = 'other_version';
@@ -821,9 +808,8 @@ describe('queued-wf-tests-simple', () => {
   });
 
   test('test-versionless-dequeue-requires-latest-version', async () => {
-    expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
-      DBOSClient.create(options),
+    const client = await withTestClientDatabase({ systemDatabaseUrl: generateDBOSTestConfig().systemDatabaseUrl }).then(
+      (options) => DBOSClient.create(options),
     );
     const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     const workerVersion = globalParams.appVersion;
@@ -1715,7 +1701,7 @@ describe('queue-time-outs', () => {
   });
 
   // enqueue workflow with timeout which enqueues a blocked child. Parent times out *before* the child. Both are cancelled
-  test('enqueue-workflow-withEnqueueChildTimeout', async () => {
+  test('enqueue-workflow-withEnqueueChildTimeout-dequeue-after-poll', async () => {
     const workflowID: string = randomUUID();
     const childID: string = `${workflowID}-0`;
     events_map.set(childID, new Event());
@@ -1977,9 +1963,8 @@ describe('queue-time-outs', () => {
     await blockedNormalHandle.getResult();
 
     // Confirm client enqueue works with partitions
-    expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
-      DBOSClient.create(options),
+    const client = await withTestClientDatabase({ systemDatabaseUrl: generateDBOSTestConfig().systemDatabaseUrl }).then(
+      (options) => DBOSClient.create(options),
     );
     try {
       const clientHandle = await client.enqueue({
@@ -2201,9 +2186,8 @@ describe('delay-tests', () => {
     expect(finalStatus!.dequeuedAt!).toBeGreaterThanOrEqual(status!.delayUntilEpochMS!);
 
     // Test via client enqueue
-    expect(config.systemDatabaseUrl).toBeDefined();
-    const client = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
-      DBOSClient.create(options),
+    const client = await withTestClientDatabase({ systemDatabaseUrl: generateDBOSTestConfig().systemDatabaseUrl }).then(
+      (options) => DBOSClient.create(options),
     );
     try {
       const tClientBefore = Date.now();
@@ -3787,7 +3771,7 @@ describe('dequeue-dispatch-cost', () => {
     await DBOS.cancelWorkflow(handle.workflowID);
   }, 30000);
 
-  test('status-fetch-chunks-and-retries-per-chunk', async () => {
+  test('[postgres-only] status-fetch-chunks-and-retries-per-chunk', async () => {
     const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // Started off-queue so the dispatcher never fetches these rows itself.
     const handles: WorkflowHandle<number>[] = [];

@@ -79,6 +79,14 @@ export type {
   ExportedWorkflow,
 } from './system_database';
 export { getSystemDatabaseExecutionContext } from './context';
+// Точки отладки SDK-тестов: альтернативный backend вызывает их в тех же местах, что PostgreSQL.
+export {
+  debugTriggerPoint,
+  DEBUG_TRIGGER_STEP_COMMIT,
+  DEBUG_TRIGGER_INITWF_COMMIT,
+  DEBUG_TRIGGER_FIND_AND_MARK_AFTER_SELECT,
+  DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES,
+} from './debugpoint';
 
 export type { ClaimScope, ClaimResult, QueueHint, HintOutcome, QueueWakeupSource } from './system_database';
 export { QueueUnavailableError } from './system_database';

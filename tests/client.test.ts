@@ -1,5 +1,6 @@
 import { PostgresSystemDatabase } from '../src/system_database';
 import { withTestClientDatabase } from './system-database-factory';
+import { openWorkflowState } from './system-database-state';
 import { workflow_status } from '../schemas/system_db_schema';
 import { DBOS, DBOSClient, StatusString } from '../src';
 import { globalParams, sleepms } from '../src/utils';
@@ -152,6 +153,25 @@ describe('DBOSClient', () => {
       return rowCount ?? 0;
     } finally {
       await other.end();
+    }
+  }
+
+  // Строка статуса через доступ к состоянию тестового backend: у внедрённой системной базы таблиц
+  // PostgreSQL нет.
+  async function statusRows(workflowID: string) {
+    const state = await openWorkflowState(config);
+    try {
+      const row = await state.readStatusColumns(workflowID, ['status', 'application_version']);
+      return row
+        ? [
+            { workflow_uuid: workflowID, ...row } as Pick<
+              workflow_status,
+              'workflow_uuid' | 'status' | 'application_version'
+            >,
+          ]
+        : [];
+    } finally {
+      await state.close();
     }
   }
 
@@ -350,10 +370,7 @@ describe('DBOSClient', () => {
     const dbClient = new Client(poolConfig);
     try {
       await dbClient.connect();
-      const resultBefore = await dbClient.query<workflow_status>(
-        'SELECT * FROM dbos.workflow_status WHERE workflow_uuid = $1',
-        [wfid],
-      );
+      const resultBefore = { rows: await statusRows(wfid) };
       expect(resultBefore.rows).toHaveLength(1);
       expect(resultBefore.rows[0].workflow_uuid).toBe(wfid);
       expect(resultBefore.rows[0].status).toBe('ENQUEUED');
@@ -365,10 +382,7 @@ describe('DBOSClient', () => {
       const wfresult = await handle.getResult();
       expect(wfresult).toBe('42-test-{"first":"John","last":"Doe","age":30}');
 
-      const resultAfter = await dbClient.query<workflow_status>(
-        'SELECT * FROM dbos.workflow_status WHERE workflow_uuid = $1',
-        [wfid],
-      );
+      const resultAfter = { rows: await statusRows(wfid) };
       expect(resultAfter.rows).toHaveLength(1);
       expect(resultAfter.rows[0].workflow_uuid).toBe(wfid);
       expect(resultAfter.rows[0].status).toBe('SUCCESS');
@@ -408,10 +422,7 @@ describe('DBOSClient', () => {
     const dbClient = new Client(poolConfig);
     try {
       await dbClient.connect();
-      const result = await dbClient.query<workflow_status>(
-        'SELECT * FROM dbos.workflow_status WHERE workflow_uuid = $1',
-        [wfid],
-      );
+      const result = { rows: await statusRows(wfid) };
       expect(result.rows).toHaveLength(1);
       expect(result.rows[0].workflow_uuid).toBe(wfid);
       expect(result.rows[0].status).toBe('SUCCESS');
@@ -457,10 +468,7 @@ describe('DBOSClient', () => {
     const dbClient = new Client(poolConfig);
     try {
       await dbClient.connect();
-      const result = await dbClient.query<workflow_status>(
-        'SELECT * FROM dbos.workflow_status WHERE workflow_uuid = $1',
-        [wfid],
-      );
+      const result = { rows: await statusRows(wfid) };
       expect(result.rows).toHaveLength(1);
       expect(result.rows[0].workflow_uuid).toBe(wfid);
       expect(result.rows[0].status).toBe('SUCCESS');
@@ -535,10 +543,7 @@ describe('DBOSClient', () => {
     const dbClient = new Client(poolConfig);
     try {
       await dbClient.connect();
-      const result = await dbClient.query<workflow_status>(
-        'SELECT * FROM dbos.workflow_status WHERE workflow_uuid = $1',
-        [wfid],
-      );
+      const result = { rows: await statusRows(wfid) };
       expect(result.rows).toHaveLength(1);
       expect(result.rows[0].workflow_uuid).toBe(wfid);
       expect(result.rows[0].status).toBe('SUCCESS');
@@ -699,10 +704,7 @@ describe('DBOSClient', () => {
     const dbClient = new Client(poolConfig);
     try {
       await dbClient.connect();
-      const result = await dbClient.query<workflow_status>(
-        'SELECT * FROM dbos.workflow_status WHERE workflow_uuid = $1',
-        [wfid],
-      );
+      const result = { rows: await statusRows(wfid) };
       expect(result.rows).toHaveLength(1);
       expect(result.rows[0].workflow_uuid).toBe(wfid);
       expect(result.rows[0].status).toBe('SUCCESS');
@@ -738,10 +740,12 @@ describe('DBOSClient', () => {
     const dbClient = new Client(poolConfig);
     try {
       await dbClient.connect();
-      const result = await dbClient.query<workflow_status>(
-        'SELECT * FROM dbos.workflow_status WHERE application_version = $1',
-        ['1234567890ABCDEF'],
-      );
+      const result = {
+        rows: (await DBOS.listWorkflows({ applicationVersion: '1234567890ABCDEF' })).map((w) => ({
+          status: w.status,
+          application_version: w.applicationVersion,
+        })),
+      };
       expect(result.rows).toHaveLength(1);
       expect(result.rows[0].status).toBe('ENQUEUED');
       expect(result.rows[0].application_version).toBe('1234567890ABCDEF');

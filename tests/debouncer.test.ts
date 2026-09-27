@@ -898,7 +898,7 @@ describe('debouncer-tests', () => {
     }
   });
 
-  test('test-debounce-bounce-atomic-with-checkpoint', async () => {
+  test('[postgres-only] test-debounce-bounce-atomic-with-checkpoint', async () => {
     // Regression test (exactly-once): an in-workflow bounce commits atomically with its step
     // checkpoint. If the checkpoint write fails, the bounce must roll back with it; otherwise a
     // recovered parent would re-bounce or re-enqueue work that already committed, running it twice.

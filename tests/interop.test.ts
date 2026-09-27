@@ -1,4 +1,5 @@
 import { withTestClientDatabase } from './system-database-factory';
+import { openWorkflowState } from './system-database-state';
 /**
  * Cross-language interoperability tests for portable workflow serialization.
  *
@@ -166,61 +167,42 @@ describe('interop-tests', () => {
 
       // ---- Verify DB records ----
 
-      // workflow_status
-      const wsResult = await systemDBClient.query<workflow_status>(
-        'SELECT * FROM dbos.workflow_status WHERE workflow_uuid = $1',
-        [wfh.workflowID],
-      );
-      expect(wsResult.rows).toHaveLength(1);
-      const wsRow = wsResult.rows[0];
-      expect(wsRow.serialization).toBe('portable_json');
-      expect(wsRow.status).toBe('SUCCESS');
-      expect(wsRow.name).toBe('canonicalWorkflow');
-      expect(wsRow.class_name).toBe('interop');
+      // Stored values are read through the backend's own state access, so the golden formats are
+      // checked on every system database (PostgreSQL tables or DynamoDB items).
+      const state = await openWorkflowState(config);
+      try {
+        const wsRow = (await state.readStatusColumns(wfh.workflowID, [
+          'status',
+          'name',
+          'class_name',
+          'serialization',
+        ]))!;
+        expect(wsRow.serialization).toBe('portable_json');
+        expect(wsRow.status).toBe('SUCCESS');
+        expect(wsRow.name).toBe('canonicalWorkflow');
+        expect(wsRow.class_name).toBe('interop');
 
-      // The payload tables are where a peer in another language reads these.
-      const wiResult = await systemDBClient.query<{ inputs: string }>(
-        'SELECT inputs FROM dbos.workflow_input WHERE workflow_uuid = $1',
-        [wfh.workflowID],
-      );
-      const woResult = await systemDBClient.query<{ output: string }>(
-        'SELECT output FROM dbos.workflow_output WHERE workflow_uuid = $1',
-        [wfh.workflowID],
-      );
+        // The payloads are where a peer in another language reads these: exact string comparison.
+        const row = (await state.readWorkflowRow(wfh.workflowID))!;
+        expect(row.inputs).toBe(GOLDEN_INPUTS_JSON);
+        expect(row.output).toBe(GOLDEN_OUTPUT_JSON);
 
-      // Input string should actually match (no need for structural compare)
-      expect(wiResult.rows[0].inputs).toBe(GOLDEN_INPUTS_JSON);
+        // workflow_events and workflow_events_history: exact string comparison
+        for (const kind of ['event', 'event_history'] as const) {
+          const values = await state.readStoredValues(kind, wfh.workflowID, 'interop_status');
+          expect(values).toHaveLength(1);
+          expect(values[0].serialization).toBe('portable_json');
+          expect(values[0].value).toBe(GOLDEN_EVENT_JSON);
+        }
 
-      // Output: exact string comparison
-      expect(woResult.rows[0].output).toBe(GOLDEN_OUTPUT_JSON);
-
-      // workflow_events: exact string comparison
-      const evtResult = await systemDBClient.query<workflow_events>(
-        'SELECT * FROM dbos.workflow_events WHERE workflow_uuid = $1 AND key = $2',
-        [wfh.workflowID, 'interop_status'],
-      );
-      expect(evtResult.rows).toHaveLength(1);
-      expect(evtResult.rows[0].serialization).toBe('portable_json');
-      expect(evtResult.rows[0].value).toBe(GOLDEN_EVENT_JSON);
-
-      // workflow_events_history: exact string comparison
-      const evthResult = await systemDBClient.query<workflow_events_history>(
-        'SELECT * FROM dbos.workflow_events_history WHERE workflow_uuid = $1 AND key = $2',
-        [wfh.workflowID, 'interop_status'],
-      );
-      expect(evthResult.rows).toHaveLength(1);
-      expect(evthResult.rows[0].serialization).toBe('portable_json');
-      expect(evthResult.rows[0].value).toBe(GOLDEN_EVENT_JSON);
-
-      // streams: exact string comparison
-      const streamResult = await systemDBClient.query<streams>(
-        'SELECT * FROM dbos.streams WHERE workflow_uuid = $1 AND key = $2',
-        [wfh.workflowID, 'interop_stream'],
-      );
-      expect(streamResult.rows).toHaveLength(1);
-      expect(streamResult.rows[0].serialization).toBe('portable_json');
-      expect(streamResult.rows[0].offset).toBe(0);
-      expect(streamResult.rows[0].value).toBe(GOLDEN_STREAM_JSON);
+        // streams: exact string comparison; one value at offset 0
+        const stream = await state.readStoredValues('stream', wfh.workflowID, 'interop_stream');
+        expect(stream).toHaveLength(1);
+        expect(stream[0].serialization).toBe('portable_json');
+        expect(stream[0].value).toBe(GOLDEN_STREAM_JSON);
+      } finally {
+        await state.close();
+      }
     } finally {
       await client.destroy();
     }

@@ -7,7 +7,7 @@ describe('hint queue dispatch', () => {
     wfQueueRunner.stop();
     jest.useRealTimers();
   });
-  function fixture(concurrency = 2) {
+  function fixture(concurrency = 2, running = () => 0) {
     let listener!: (hint: QueueHint) => Promise<HintOutcome>;
     let subscribed!: () => void;
     const ready = new Promise<void>((resolve) => {
@@ -42,7 +42,7 @@ describe('hint queue dispatch', () => {
       queueControlListeners: new Set(),
       queueBudgetListeners: new Set(),
       listQueues: async () => [WorkflowQueue.recordFromParams('hint-test', { workerConcurrency: concurrency })],
-      countRunningWorkflowsForQueue: () => 0,
+      countRunningWorkflowsForQueue: () => running(),
       countRunningWorkflowsForPartition: () => 0,
       findAndMarkStartableWorkflows: claim,
       transitionDelayedWorkflows: async () => {},
@@ -60,6 +60,8 @@ describe('hint queue dispatch', () => {
       claim,
       publish,
       exec,
+      source,
+      db,
       hint: (shard: number) => listener({ queueName: 'hint-test', scope: 'app', shard }),
     };
   }
@@ -104,6 +106,65 @@ describe('hint queue dispatch', () => {
     await jest.advanceTimersByTimeAsync(1100);
     expect(f.publish).toHaveBeenCalledWith({ queueName: 'hint-test', scope: 'app', shard: 7 });
     expect(f.claim).toHaveBeenCalledTimes(1);
+    wfQueueRunner.stop();
+    await f.loop;
+  });
+  test('global limit parks the hint until the blocked probe reports new quota', async () => {
+    jest.useFakeTimers();
+    const f = fixture();
+    const probe = jest.fn(async (_name: string, hints: QueueHint[]) => hints);
+    (f.source as { probeBlocked?: typeof probe }).probeBlocked = probe;
+    await f.ready;
+    f.claim.mockResolvedValueOnce({ workflowIds: [], limitedBy: 'global' });
+    await f.hint(3);
+    await jest.advanceTimersByTimeAsync(500);
+    expect(f.publish).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(600);
+    expect(probe).toHaveBeenCalledWith('hint-test', [{ queueName: 'hint-test', scope: 'app', shard: 3 }]);
+    expect(f.publish).toHaveBeenCalledWith({ queueName: 'hint-test', scope: 'app', shard: 3 });
+    wfQueueRunner.stop();
+    await f.loop;
+  });
+  test('contention retries by an exponential timer and resets after progress', async () => {
+    jest.useFakeTimers();
+    const f = fixture();
+    await f.ready;
+    f.claim.mockResolvedValueOnce({ workflowIds: [], limitedBy: 'contention' });
+    await f.hint(1);
+    await jest.advanceTimersByTimeAsync(60);
+    expect(f.publish).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(100);
+    expect(f.publish).toHaveBeenCalledTimes(1);
+    f.claim.mockResolvedValueOnce({ workflowIds: [], limitedBy: 'contention' });
+    await f.hint(1);
+    await jest.advanceTimersByTimeAsync(160);
+    expect(f.publish).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(150);
+    expect(f.publish).toHaveBeenCalledTimes(2);
+    wfQueueRunner.stop();
+    await f.loop;
+  });
+  test('a hint without budget waits for the budget listener instead of polling', async () => {
+    let running = 1;
+    const f = fixture(1, () => running);
+    await f.ready;
+    await f.hint(2);
+    expect(f.claim.mock.calls[0][6]?.reservedBudget).toBe(0);
+    expect(f.publish).not.toHaveBeenCalled();
+    running = 0;
+    for (const listener of f.db.queueBudgetListeners as Set<(name: string) => void>) listener('hint-test');
+    expect(f.publish).toHaveBeenCalledWith({ queueName: 'hint-test', scope: 'app', shard: 2 });
+    wfQueueRunner.stop();
+    await f.loop;
+  });
+  test('a full batch reports drainedFull only when the budget is spent and repolls the shard', async () => {
+    jest.useFakeTimers();
+    const f = fixture(2);
+    await f.ready;
+    f.claim.mockResolvedValueOnce({ workflowIds: ['a', 'b'] });
+    expect(await f.hint(4)).toMatchObject({ drainedFull: true });
+    await jest.advanceTimersByTimeAsync(100);
+    expect(f.publish).toHaveBeenCalledWith({ queueName: 'hint-test', scope: 'app', shard: 4 });
     wfQueueRunner.stop();
     await f.loop;
   });

@@ -47,19 +47,15 @@ function unpolledQueue() {
 }
 
 async function createdAtByWorkflowID(prefix: string): Promise<Map<string, { createdAt: number; key: string | null }>> {
-  const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
-  const { rows } = await sysdb.pool.query<{
-    workflow_uuid: string;
-    created_at: string;
-    queue_partition_key: string | null;
-  }>(
-    `SELECT workflow_uuid, created_at, queue_partition_key
-     FROM "${sysdb.schemaName}".workflow_status WHERE workflow_uuid LIKE $1`,
-    [`${prefix}-%`],
-  );
+  // Через порт системной базы, чтобы проверка шла на любом backend.
+  const rows = await DBOSExecutor.globalInstance!.systemDatabase.listWorkflows({
+    workflow_id_prefix: `${prefix}-`,
+    loadInput: false,
+    loadOutput: false,
+  });
   const byID = new Map<string, { createdAt: number; key: string | null }>();
   for (const row of rows) {
-    byID.set(row.workflow_uuid, { createdAt: Number(row.created_at), key: row.queue_partition_key });
+    byID.set(row.workflowUUID, { createdAt: Number(row.createdAt), key: row.queuePartitionKey ?? null });
   }
   return byID;
 }

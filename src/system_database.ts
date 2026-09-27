@@ -943,14 +943,16 @@ export type SystemDatabaseFactory = (ctx: SystemDatabaseContext) => SystemDataba
 export type ClaimScope = {
   scope: string;
   shard: number;
+  /** Process budget reserved by the runner for this claim (workerConcurrency). */
   reservedBudget?: number;
-  partitionBudget?: (partition: string) => number;
+  /** Reserves one partitionWorkerConcurrency slot for a candidate; false skips the candidate. */
   reservePartition?: (partition: string, workflowId: string) => boolean;
 };
 export type ClaimResult = {
   workflowIds: string[];
   limitedBy?: 'rate' | 'global' | 'contention';
   retryAt?: number;
+  /** Earliest end of a partitionRateLimit window among partitions left unready (epoch ms). */
   wakeAt?: number;
 };
 export type QueueHint = { queueName: string; scope: string; shard: number };

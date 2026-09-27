@@ -1019,6 +1019,14 @@ class WFQueueRunner {
     const unsubscribe = source.subscribe(async (h) => {
       const key = JSON.stringify(h),
         state = this.states.get(h.queueName);
+      if (this.isRunning && !state) {
+        // Hint for a queue registered after the last metadata refresh: reload and redeliver it.
+        control();
+        void refresh?.then(() => {
+          if (this.states.has(h.queueName)) publish(h);
+        });
+        return { drainedFull: false };
+      }
       if (!this.isRunning || !state || state.queue.paused) return { drainedFull: false };
       clearTimeout(timers.get(key));
       timers.delete(key);
@@ -1065,7 +1073,11 @@ class WFQueueRunner {
               },
             },
           );
+          if (result.workflowIds.length > 0) await debugTriggerPoint(DEBUG_TRIGGER_WORKFLOW_QUEUE_START);
           await exec.dispatchDequeuedWorkflows(result.workflowIds);
+          // Same point as the SQL sweep: the partition's workflows are dispatched and the lane is still held.
+          if (result.workflowIds.length > 0 && isPartitionedQueue(state.queue))
+            await debugTriggerPoint(DEBUG_TRIGGER_BETWEEN_PARTITION_DISPATCHES);
           if (result.limitedBy === 'contention') {
             const delay = Math.min(5000, (backoff.get(key) ?? 50) * 2);
             backoff.set(key, delay);

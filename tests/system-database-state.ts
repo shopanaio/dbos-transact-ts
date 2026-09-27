@@ -19,10 +19,16 @@ export interface WorkflowStateAccess {
   readOutcome(workflowID: string): Promise<{ status: string; output: string | null; error: string | null }>;
   /** Plant the checkpoint of a concurrent execution at `functionID`. */
   plantStepCheckpoint(workflowID: string, functionID: number, functionName: string): Promise<void>;
+  /** Stamp the executor marker (and the status, if given) as another executor would have. */
+  setExecutor(workflowID: string, executorID: string, status?: string): Promise<void>;
+  /** The executor marker of the workflow. */
+  readExecutor(workflowID: string): Promise<string | null>;
   setRecoveryAttempts(workflowID: string, attempts: number): Promise<void>;
   readRecoveryAttempts(workflowID: string): Promise<number>;
   /** Remove the workflow's status, as a concurrent delete would. */
   deleteWorkflowStatus(workflowID: string): Promise<void>;
+  /** workflow_status columns by their PostgreSQL names; an absent value reads as null. */
+  readStatusColumns(workflowID: string, columns: StatusColumn[]): Promise<Record<string, unknown> | undefined>;
   /** The status with its payloads resolved, the shape every reader in the SDK sees. */
   readWorkflowRow(workflowID: string): Promise<WorkflowRow | undefined>;
   /** Stored values and their serialization, in write order (stream offset order for streams). */
@@ -52,6 +58,20 @@ export interface WorkflowStateAccess {
   sql(): Client;
   close(): Promise<void>;
 }
+
+export type StatusColumn =
+  | 'status'
+  | 'name'
+  | 'class_name'
+  | 'queue_name'
+  | 'application_version'
+  | 'application_name'
+  | 'priority'
+  | 'deduplication_id'
+  | 'authenticated_user'
+  | 'authenticated_roles'
+  | 'rate_limited'
+  | 'serialization';
 
 export type WorkflowRow = {
   status: string;
@@ -113,6 +133,21 @@ class PostgresWorkflowState implements WorkflowStateAccess {
     );
   }
 
+  async setExecutor(workflowID: string, executorID: string, status?: string) {
+    await this.client.query(
+      `UPDATE dbos.workflow_status SET executor_id=$1, status=COALESCE($2, status) WHERE workflow_uuid=$3`,
+      [executorID, status ?? null, workflowID],
+    );
+  }
+
+  async readExecutor(workflowID: string) {
+    const { rows } = await this.client.query<{ executor_id: string | null }>(
+      `SELECT executor_id FROM dbos.workflow_status WHERE workflow_uuid=$1`,
+      [workflowID],
+    );
+    return rows[0]?.executor_id ?? null;
+  }
+
   async setRecoveryAttempts(workflowID: string, attempts: number) {
     await this.client.query(`UPDATE dbos.workflow_status SET recovery_attempts=$1 WHERE workflow_uuid=$2`, [
       attempts,
@@ -130,6 +165,14 @@ class PostgresWorkflowState implements WorkflowStateAccess {
 
   async deleteWorkflowStatus(workflowID: string) {
     await this.client.query(`DELETE FROM dbos.workflow_status WHERE workflow_uuid=$1`, [workflowID]);
+  }
+
+  async readStatusColumns(workflowID: string, columns: StatusColumn[]) {
+    const { rows } = await this.client.query<Record<string, unknown>>(
+      `SELECT ${columns.join(', ')} FROM dbos.workflow_status WHERE workflow_uuid=$1`,
+      [workflowID],
+    );
+    return rows[0];
   }
 
   async readWorkflowRow(workflowID: string) {

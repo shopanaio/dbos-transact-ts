@@ -399,8 +399,21 @@ describe('application-name', () => {
     await DBOS.launch();
     const queue = await DBOS.registerQueue('appname-dequeue-queue');
 
-    // A peer's enqueued workflow on our queue must never be dequeued here.
-    await insertPeerWorkflow(client, 'appname-dequeue-peer', { queueName: queue.name });
+    // A peer's enqueued workflow on our queue must never be dequeued here. Written through a client
+    // acting for the peer, so the scenario runs on every system database backend.
+    const peer = await withTestClientDatabase({
+      systemDatabaseUrl: config.systemDatabaseUrl!,
+      applicationName: PEER,
+    }).then((options) => DBOSClient.create(options));
+    try {
+      await peer.enqueue<NoArgWorkflow>({
+        queueName: queue.name,
+        workflowName: 'peerWorkflow',
+        workflowID: 'appname-dequeue-peer',
+      });
+    } finally {
+      await peer.destroy();
+    }
 
     // An unclaimed workflow belongs to every application, so this one claims it.
     const anonymous = await withTestClientDatabase({ systemDatabaseUrl: config.systemDatabaseUrl! }).then((options) =>
@@ -422,13 +435,9 @@ describe('application-name', () => {
     expect(await ownerOf(client, 'workflow_status', 'workflow_uuid', unclaimedID)).toBe(APP);
 
     // The peer's row is untouched: still ENQUEUED, still theirs.
-    const { rows } = await client
-      .sql()
-      .query<{ status: string; application_name: string }>(
-        `SELECT status, application_name FROM dbos.workflow_status WHERE workflow_uuid = 'appname-dequeue-peer'`,
-      );
-    expect(rows[0].status).toBe(StatusString.ENQUEUED);
-    expect(rows[0].application_name).toBe(PEER);
+    const row = await client.readStatusColumns('appname-dequeue-peer', ['status', 'application_name']);
+    expect(row?.status).toBe(StatusString.ENQUEUED);
+    expect(row?.application_name).toBe(PEER);
   });
 
   test('bulk operations across applications', async () => {

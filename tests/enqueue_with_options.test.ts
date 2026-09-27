@@ -1,4 +1,4 @@
-import { Client } from 'pg';
+import { openWorkflowState, type WorkflowStateAccess } from './system-database-state';
 import { DBOS, StatusString } from '../src';
 import { DBOSConfig } from '../src/dbos-executor';
 import { generateDBOSTestConfig, setUpDBOSTestSysDb } from './helpers';
@@ -14,20 +14,19 @@ const authWorkflow = DBOS.registerWorkflow(
 
 describe('enqueue-workflow-with-options', () => {
   let config: DBOSConfig;
-  let client: Client;
+  let state: WorkflowStateAccess;
 
   beforeEach(async () => {
     config = generateDBOSTestConfig();
     config.name = 'enqueue-options-app';
     await setUpDBOSTestSysDb(config);
     DBOS.setConfig(config);
-    client = new Client({ connectionString: config.systemDatabaseUrl });
-    await client.connect();
+    state = await openWorkflowState(config);
   });
 
   afterEach(async () => {
     await DBOS.shutdown();
-    await client.end();
+    await state.close();
   });
 
   test('enqueues a workflow this process does not implement', async () => {
@@ -40,27 +39,24 @@ describe('enqueue-workflow-with-options', () => {
       2,
     );
 
-    const { rows } = await client.query<{
-      status: string;
-      name: string;
-      class_name: string | null;
-      queue_name: string | null;
-      application_version: string | null;
-      application_name: string | null;
-      inputs: string;
-    }>(
-      `SELECT status, name, class_name, queue_name, application_version, application_name, inputs
-       FROM dbos.workflow_status WHERE workflow_uuid = $1`,
-      [handle.workflowID],
-    );
+    const rows = [
+      await state.readStatusColumns(handle.workflowID, [
+        'status',
+        'name',
+        'class_name',
+        'queue_name',
+        'application_version',
+        'application_name',
+      ]),
+    ].filter((row) => row !== undefined);
     expect(rows).toHaveLength(1);
-    expect(rows[0].status).toBe(StatusString.ENQUEUED);
-    expect(rows[0].name).toBe('aWorkflowElsewhere');
-    expect(rows[0].class_name).toBe('RemoteClass');
-    expect(rows[0].queue_name).toBe(QUEUE);
+    expect(rows[0]!.status).toBe(StatusString.ENQUEUED);
+    expect(rows[0]!.name).toBe('aWorkflowElsewhere');
+    expect(rows[0]!.class_name).toBe('RemoteClass');
+    expect(rows[0]!.queue_name).toBe(QUEUE);
     // Left unset unless given: the target may belong to another executor.
-    expect(rows[0].application_version).toBeNull();
-    expect(rows[0].application_name).toBe('enqueue-options-app');
+    expect(rows[0]!.application_version).toBeNull();
+    expect(rows[0]!.application_name).toBe('enqueue-options-app');
   });
 
   test('portable form carries named arguments', async () => {
@@ -73,15 +69,9 @@ describe('enqueue-workflow-with-options', () => {
       { keyword: 42 },
     );
 
-    const { rows } = await client.query<{ inputs: string; serialization: string | null }>(
-      `SELECT wi.inputs, ws.serialization
-       FROM dbos.workflow_status ws
-       JOIN dbos.workflow_input wi ON wi.workflow_uuid = ws.workflow_uuid
-       WHERE ws.workflow_uuid = $1`,
-      [handle.workflowID],
-    );
-    expect(rows[0].serialization).toBe('portable_json');
-    expect(JSON.parse(rows[0].inputs)).toEqual({ positionalArgs: ['positional'], namedArgs: { keyword: 42 } });
+    const row = await state.readWorkflowRow(handle.workflowID);
+    expect(row?.serialization).toBe('portable_json');
+    expect(JSON.parse(row!.inputs)).toEqual({ positionalArgs: ['positional'], namedArgs: { keyword: 42 } });
   });
 
   test('honours explicit options over the ambient defaults', async () => {
@@ -99,20 +89,16 @@ describe('enqueue-workflow-with-options', () => {
     });
     expect(handle.workflowID).toBe('enqueue-options-preset-id');
 
-    const { rows } = await client.query<{
-      application_version: string | null;
-      application_name: string | null;
-      priority: number;
-      deduplication_id: string | null;
-    }>(
-      `SELECT application_version, application_name, priority, deduplication_id
-       FROM dbos.workflow_status WHERE workflow_uuid = $1`,
-      ['enqueue-options-preset-id'],
-    );
-    expect(rows[0].application_version).toBe('v-explicit');
-    expect(rows[0].application_name).toBe('another-app');
-    expect(rows[0].priority).toBe(5);
-    expect(rows[0].deduplication_id).toBe('dedup-key');
+    const row = (await state.readStatusColumns('enqueue-options-preset-id', [
+      'application_version',
+      'application_name',
+      'priority',
+      'deduplication_id',
+    ]))!;
+    expect(row.application_version).toBe('v-explicit');
+    expect(row.application_name).toBe('another-app');
+    expect(row.priority).toBe(5);
+    expect(row.deduplication_id).toBe('dedup-key');
   });
 
   test('takes the workflow ID from the ambient context', async () => {
@@ -168,10 +154,7 @@ describe('enqueue-workflow-with-options', () => {
     const forkHandle = await DBOS.forkWorkflow<string>(handle.workflowID, 1, { queueName: QUEUE });
     expect(await forkHandle.getResult()).toBe(childID);
 
-    const { rows } = await client.query<{ count: string }>(
-      `SELECT COUNT(*) as count FROM dbos.workflow_status WHERE name = 'aWorkflowElsewhere'`,
-    );
-    expect(Number(rows[0].count)).toBe(1);
+    expect(await DBOS.listWorkflows({ workflowName: 'aWorkflowElsewhere' })).toHaveLength(1);
   });
 
   test('records authentication from explicit options or ambient context', async () => {
@@ -211,15 +194,12 @@ describe('enqueue-workflow-with-options', () => {
     expect(enqueued).toBe('bob|reader');
     expect(ambient).toBe('carol|ops');
 
-    const { rows } = await client.query<{
-      workflow_uuid: string;
-      authenticated_user: string | null;
-      authenticated_roles: string | null;
-    }>(
-      `SELECT workflow_uuid, authenticated_user, authenticated_roles
-       FROM dbos.workflow_status WHERE workflow_uuid = ANY($1) ORDER BY workflow_uuid`,
-      [['auth-explicit', 'auth-enqueued', 'auth-ambient']],
-    );
+    const rows: Record<string, unknown>[] = [];
+    for (const id of ['auth-ambient', 'auth-enqueued', 'auth-explicit'])
+      rows.push({
+        workflow_uuid: id,
+        ...(await state.readStatusColumns(id, ['authenticated_user', 'authenticated_roles'])),
+      });
     expect(rows.map((r) => [r.workflow_uuid, r.authenticated_user, r.authenticated_roles])).toEqual([
       ['auth-ambient', 'carol', '["ops"]'],
       ['auth-enqueued', 'bob', '["reader"]'],

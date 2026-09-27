@@ -10,7 +10,7 @@ import {
   setWfAndChildrenToPending,
 } from './helpers';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
-import { Client } from 'pg';
+import { openWorkflowState, type WorkflowStateAccess } from './system-database-state';
 import { StatusString } from '../dist/src';
 import { DBOSAwaitedWorkflowExceededMaxRecoveryAttempts } from '../src/error';
 import { INTERNAL_QUEUE_NAME } from '../src/utils';
@@ -25,7 +25,7 @@ import { globalParams } from '../src/utils';
 
 describe('recovery-tests', () => {
   let config: DBOSConfig;
-  let systemDBClient: Client;
+  let state: WorkflowStateAccess;
   const queue = { name: 'DLQQ' };
 
   beforeAll(async () => {
@@ -38,14 +38,11 @@ describe('recovery-tests', () => {
     await DBOS.launch();
     await DBOS.registerQueue(queue.name, { onConflict: 'always_update', concurrency: 1 });
     process.env.DBOS__VMID = '';
-    systemDBClient = new Client({
-      connectionString: config.systemDatabaseUrl,
-    });
-    await systemDBClient.connect();
+    state = await openWorkflowState(config);
   });
 
   afterEach(async () => {
-    await systemDBClient.end();
+    await state.close();
     await DBOS.shutdown();
   });
 
@@ -133,20 +130,13 @@ describe('recovery-tests', () => {
     await RestampExecutor.stepOneDone.wait();
 
     // Simulate another executor holding the marker.
-    await systemDBClient.query(`UPDATE dbos.workflow_status SET executor_id=$1 WHERE workflow_uuid=$2`, [
-      'stale-executor',
-      handle.workflowID,
-    ]);
+    await state.setExecutor(handle.workflowID, 'stale-executor');
 
     RestampExecutor.proceed.set();
     await expect(handle.getResult()).resolves.toBe(2);
 
     // Checkpointing the second step should have re-stamped executor_id to this executor.
-    const result = await systemDBClient.query<{ executor_id: string }>(
-      `SELECT executor_id FROM dbos.workflow_status WHERE workflow_uuid=$1`,
-      [handle.workflowID],
-    );
-    expect(result.rows[0].executor_id).toBe(globalParams.executorID);
+    expect(await state.readExecutor(handle.workflowID)).toBe(globalParams.executorID);
   });
 
   test('dead-letter-queue', async () => {
@@ -289,11 +279,7 @@ describe('recovery-tests', () => {
     // Release the workflow even on failure: anything that escapes while it is blocked wedges shutdown in teardown and hangs the suite.
     try {
       // Orphan the workflow: PENDING, owned by an executor that is now dead.
-      await systemDBClient.query(`UPDATE dbos.workflow_status SET status=$1, executor_id=$2 WHERE workflow_uuid=$3`, [
-        StatusString.PENDING,
-        'deadexecutor',
-        handle.workflowID,
-      ]);
+      await state.setExecutor(handle.workflowID, 'deadexecutor', StatusString.PENDING);
 
       // A sweep naming a different executor must not touch the row.
       await expect(
