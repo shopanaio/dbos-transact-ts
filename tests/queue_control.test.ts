@@ -72,8 +72,9 @@ describe('[postgres-only] persisted queue control and readiness', () => {
     return id;
   }
   const dequeue = (q: WorkflowQueue, partition?: string) =>
-    db.findAndMarkStartableWorkflows(q, 'worker', version(), partition);
-  const batchDequeue = (q: WorkflowQueue) => db.findAndMarkStartablePartitionedWorkflows(q, 'worker', version(), 10);
+    db.findAndMarkStartableWorkflows(q, 'worker', version(), partition).then((result) => result.workflowIds);
+  const batchDequeue = (q: WorkflowQueue) =>
+    db.findAndMarkStartablePartitionedWorkflows(q, 'worker', version(), 10).then((result) => result.workflowIds);
   async function row(id: string) {
     return (await db.pool.query('SELECT * FROM dbos.workflow_status WHERE workflow_uuid = $1', [id])).rows[0];
   }

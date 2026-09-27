@@ -10,6 +10,8 @@ import {
   type QueueControlState,
   type QueueRecord,
   type SystemDatabase,
+  type QueueHint,
+  type QueueWakeupSource,
 } from './system_database';
 import type { GlobalLogger } from './telemetry/logs';
 import { globalParams, RESERVED_QUEUE_NAME_PREFIX } from './utils';
@@ -691,6 +693,9 @@ class WFQueueRunner {
     batchSize = 1000,
     coalesceMs = 50,
   ): Promise<void> {
+    if (exec.systemDatabase.queueWakeupSource?.mode === 'hint') {
+      return this.hintLoop(exec, listenQueuesArg, maxConcurrentQueueDispatches, exec.systemDatabase.queueWakeupSource);
+    }
     this.isRunning = true;
     this.states.clear();
     this.wakePending = false;
@@ -942,6 +947,218 @@ class WFQueueRunner {
     }
   }
 
+  private async hintLoop(
+    exec: DBOSExecutor,
+    listen: string[] | null,
+    maxDispatches: number,
+    source: Extract<QueueWakeupSource, { mode: 'hint' }>,
+  ): Promise<void> {
+    this.isRunning = true;
+    this.abortController = new AbortController();
+    this.listenQueueNames = listen ? new Set(listen) : null;
+    this.states.clear();
+    for (const q of this.internalQueues.values()) this.ensureState(q, Date.now());
+    const db = exec.systemDatabase;
+    const active = new Set<string>(),
+      work = new Set<Promise<unknown>>(),
+      reserved = new Map<string, number>();
+    const partitionReservations = new Map<string, number>();
+    const deadlines = new Map<string, number>();
+    const blocked = new Map<string, QueueHint>();
+    const pending = new Map<string, QueueHint>(),
+      timers = new Map<string, ReturnType<typeof setTimeout>>(),
+      backoff = new Map<string, number>();
+    const budget = (name: string) => {
+      const q = this.states.get(name)?.queue;
+      return q && !q.paused
+        ? Math.max(0, workerBudget(q, db.countRunningWorkflowsForQueue(name) + (reserved.get(name) ?? 0)))
+        : 0;
+    };
+    const publish = (h: QueueHint) => {
+      if (this.isRunning) void source.publish(h).catch((e) => exec.logger.warn(String(e)));
+    };
+    const schedule = (h: QueueHint, ms: number) => {
+      const key = JSON.stringify(h),
+        deadline = Date.now() + Math.max(1, ms);
+      if ((deadlines.get(key) ?? Infinity) <= deadline) return;
+      clearTimeout(timers.get(key));
+      deadlines.set(key, deadline);
+      const timer = setTimeout(
+        () => {
+          timers.delete(key);
+          deadlines.delete(key);
+          publish(h);
+        },
+        Math.max(1, ms) + Math.random() * 50,
+      );
+      timers.set(key, timer);
+    };
+    const budgetHint = (name: string) => {
+      for (const [key, h] of pending)
+        if (h.queueName === name && budget(name) > 0) {
+          pending.delete(key);
+          publish(h);
+        }
+    };
+    const metadata = async () => {
+      this.applyMetadata(await db.listQueues());
+    };
+    let refresh: Promise<void> | undefined;
+    const control = () => {
+      refresh ??= metadata()
+        .catch((e) => exec.logger.warn(String(e)))
+        .finally(() => {
+          refresh = undefined;
+        });
+    };
+    for (const q of this.internalQueues.values())
+      await db.registerInternalQueue?.(WorkflowQueue.recordFromParams(q.name, q));
+    await metadata();
+    if (this.abortController.signal.aborted) return;
+    source.setBudgetProbe((name) => budget(name) > 0 && active.size < maxDispatches);
+    const unsubscribe = source.subscribe(async (h) => {
+      const key = JSON.stringify(h),
+        state = this.states.get(h.queueName);
+      if (!this.isRunning || !state || state.queue.paused) return { drainedFull: false };
+      clearTimeout(timers.get(key));
+      timers.delete(key);
+      deadlines.delete(key);
+      blocked.delete(key);
+      if (active.has(key) || active.size >= maxDispatches) {
+        pending.set(key, h);
+        return { drainedFull: false };
+      }
+      const count = Math.min(24, budget(h.queueName));
+      if (!count) pending.set(key, h);
+      active.add(key);
+      reserved.set(h.queueName, (reserved.get(h.queueName) ?? 0) + count);
+      const ownedPartitions = new Map<string, Set<string>>();
+      const run = (async () => {
+        try {
+          const result = await db.findAndMarkStartableWorkflows(
+            state.queue,
+            exec.executorID,
+            globalParams.appVersion,
+            undefined,
+            db.countRunningWorkflowsForQueue(h.queueName),
+            0,
+            {
+              scope: h.scope,
+              shard: h.shard,
+              reservedBudget: count,
+              reservePartition: (part, workflowId) => {
+                const identity = JSON.stringify([h.queueName, part]);
+                let owned = ownedPartitions.get(identity);
+                if (owned?.has(workflowId)) return true;
+                const available =
+                  (state.queue.partitionWorkerConcurrency ?? Infinity) -
+                  db.countRunningWorkflowsForPartition(h.queueName, part) -
+                  (partitionReservations.get(identity) ?? 0);
+                if (available <= 0) return false;
+                if (!owned) {
+                  owned = new Set();
+                  ownedPartitions.set(identity, owned);
+                }
+                owned.add(workflowId);
+                partitionReservations.set(identity, (partitionReservations.get(identity) ?? 0) + 1);
+                return true;
+              },
+            },
+          );
+          await exec.dispatchDequeuedWorkflows(result.workflowIds);
+          if (result.limitedBy === 'contention') {
+            const delay = Math.min(5000, (backoff.get(key) ?? 50) * 2);
+            backoff.set(key, delay);
+            schedule(h, delay);
+          } else {
+            backoff.delete(key);
+            if (result.limitedBy === 'rate') schedule(h, (result.retryAt ?? Date.now() + 1000) - Date.now());
+            else if (result.limitedBy === 'global') blocked.set(key, h);
+          }
+          if (result.wakeAt !== undefined) schedule(h, result.wakeAt - Date.now());
+          const full = count > 0 && result.workflowIds.length === count;
+          if (full && !result.limitedBy) schedule(h, 1);
+          return { drainedFull: full && budget(h.queueName) <= 0, wakeAt: result.wakeAt };
+        } catch (error) {
+          if (isContentionError(error)) {
+            const delay = Math.min(5000, (backoff.get(key) ?? 50) * 2);
+            backoff.set(key, delay);
+            schedule(h, delay);
+          } else if (!(error instanceof QueueUnavailableError)) exec.logger.warn(String(error));
+          return { drainedFull: false };
+        } finally {
+          for (const [identity, ids] of ownedPartitions) {
+            const remaining = (partitionReservations.get(identity) ?? 0) - ids.size;
+            if (remaining) partitionReservations.set(identity, remaining);
+            else partitionReservations.delete(identity);
+          }
+          active.delete(key);
+          reserved.set(h.queueName, (reserved.get(h.queueName) ?? count) - count);
+          for (const name of new Set([...pending.values()].map((h) => h.queueName))) budgetHint(name);
+        }
+      })();
+      work.add(run);
+      try {
+        return await run;
+      } finally {
+        work.delete(run);
+      }
+    });
+    db.queueControlListeners.add(control);
+    db.queueBudgetListeners.add(budgetHint);
+    let probing = false;
+    const blockedTimer = setInterval(() => {
+      if (probing || !blocked.size) return;
+      probing = true;
+      const task = (async () => {
+        for (const name of new Set([...blocked.values()].map((h) => h.queueName))) {
+          const hints = [...blocked.values()].filter((h) => h.queueName === name);
+          const ready = source.probeBlocked ? await source.probeBlocked(name, hints) : hints;
+          for (const h of ready) {
+            blocked.delete(JSON.stringify(h));
+            publish(h);
+          }
+        }
+      })()
+        .catch((e) => exec.logger.warn(String(e)))
+        .finally(() => {
+          probing = false;
+          work.delete(task);
+        });
+      work.add(task);
+    }, source.blockedProbeMs);
+    const timer = setInterval(control, source.metadataRefreshMs);
+    let transitioning = false;
+    const delayed = setInterval(() => {
+      if (!transitioning) {
+        transitioning = true;
+        const p = db
+          .transitionDelayedWorkflows()
+          .catch((e) => exec.logger.warn(String(e)))
+          .finally(() => {
+            transitioning = false;
+            work.delete(p);
+          });
+        work.add(p);
+      }
+    }, 1000);
+    try {
+      await new Promise<void>((resolve) =>
+        this.abortController!.signal.addEventListener('abort', () => resolve(), { once: true }),
+      );
+    } finally {
+      this.isRunning = false;
+      clearInterval(timer);
+      clearInterval(blockedTimer);
+      clearInterval(delayed);
+      unsubscribe();
+      timers.forEach(clearTimeout);
+      db.queueControlListeners.delete(control);
+      db.queueBudgetListeners.delete(budgetHint);
+      await Promise.allSettled([...work, refresh]);
+    }
+  }
+
   /** Poll one queue once, starting ready workflows; returns true if DB contention was detected. */
   private async pollQueue(exec: DBOSExecutor, queue: WorkflowQueue): Promise<boolean> {
     let contentionDetected = false;
@@ -963,7 +1180,7 @@ class WFQueueRunner {
           undefined,
           sysdb.countRunningWorkflowsForQueue(queue.name),
         );
-        await dispatch(wfids);
+        await dispatch(wfids.workflowIds);
       } else if (
         queue.partitionConcurrency === 1 &&
         queue.concurrency === undefined &&
@@ -979,7 +1196,7 @@ class WFQueueRunner {
             globalParams.appVersion,
             maxTasks,
           );
-          await dispatch(wfids);
+          await dispatch(wfids.workflowIds);
         }
       } else {
         // Every other partitioned config sweeps one partition at a time, in random order to prevent starvation.
@@ -991,14 +1208,16 @@ class WFQueueRunner {
           if (!this.isRunning || workerBudget(queue, running + claimed) <= 0) break;
           let partitionWfids: string[];
           try {
-            partitionWfids = await sysdb.findAndMarkStartableWorkflows(
-              queue,
-              exec.executorID,
-              globalParams.appVersion,
-              partitionKey,
-              running + claimed,
-              sysdb.countRunningWorkflowsForPartition(queue.name, partitionKey),
-            );
+            partitionWfids = (
+              await sysdb.findAndMarkStartableWorkflows(
+                queue,
+                exec.executorID,
+                globalParams.appVersion,
+                partitionKey,
+                running + claimed,
+                sysdb.countRunningWorkflowsForPartition(queue.name, partitionKey),
+              )
+            ).workflowIds;
           } catch (e) {
             // Lock held or claim raced by another worker: skip just this partition, no queue-wide backoff.
             if (isContentionError(e)) continue;

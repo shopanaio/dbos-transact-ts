@@ -940,7 +940,36 @@ export interface SystemDatabaseContext {
 export type WaitPollingKind = 'result' | 'event' | 'stream';
 export type SystemDatabaseFactory = (ctx: SystemDatabaseContext) => SystemDatabase;
 
+export type ClaimScope = {
+  scope: string;
+  shard: number;
+  reservedBudget?: number;
+  partitionBudget?: (partition: string) => number;
+  reservePartition?: (partition: string, workflowId: string) => boolean;
+};
+export type ClaimResult = {
+  workflowIds: string[];
+  limitedBy?: 'rate' | 'global' | 'contention';
+  retryAt?: number;
+  wakeAt?: number;
+};
+export type QueueHint = { queueName: string; scope: string; shard: number };
+export type HintOutcome = { drainedFull: boolean; wakeAt?: number };
+export type QueueWakeupSource =
+  | { mode: 'probe' }
+  | {
+      mode: 'hint';
+      subscribe(listener: (hint: QueueHint) => Promise<HintOutcome>): () => void;
+      setBudgetProbe(probe: (queueName: string) => boolean): void;
+      publish(hint: QueueHint): Promise<void>;
+      metadataRefreshMs: number;
+      blockedProbeMs: number;
+      probeBlocked?(queueName: string, hints: QueueHint[]): Promise<QueueHint[]>;
+    };
+
 export interface SystemDatabase extends Pick<SystemDatabaseLocalState, keyof SystemDatabaseLocalState> {
+  readonly queueWakeupSource?: QueueWakeupSource;
+  registerInternalQueue?(record: QueueRecord): Promise<void>;
   readonly serializer: DBOSSerializer;
   readonly appName?: string;
   readonly logger: GlobalLogger;
@@ -1139,13 +1168,15 @@ export interface SystemDatabase extends Pick<SystemDatabaseLocalState, keyof Sys
     queuePartitionKey?: string,
     localRunningCount?: number,
     partitionLocalRunningCount?: number,
-  ): Promise<string[]>;
+    claimScope?: ClaimScope,
+  ): Promise<ClaimResult>;
   findAndMarkStartablePartitionedWorkflows(
     queue: WorkflowQueue,
     executorID: string,
     appVersion: string,
     maxTasks?: number,
-  ): Promise<string[]>;
+    claimScope?: ClaimScope,
+  ): Promise<ClaimResult>;
   listWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatusInternal[]>;
   getWorkflowAggregates(input: GetWorkflowAggregatesInput): Promise<WorkflowAggregateRow[]>;
   getStepAggregates(input: GetStepAggregatesInput): Promise<StepAggregateRow[]>;
@@ -3895,7 +3926,8 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
     queuePartitionKey?: string,
     localRunningCount: number = 0,
     partitionLocalRunningCount: number = 0,
-  ): Promise<string[]> {
+    _claimScope?: ClaimScope,
+  ): Promise<ClaimResult> {
     const claimedIDs: string[] = [];
     const partitionParams: string[] = queuePartitionKey !== undefined ? [queuePartitionKey] : [];
     // Shares a concurrency or rate limit budget with other executors.
@@ -3968,7 +4000,7 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
       }
       if (maxTasks <= 0) {
         await client.query('COMMIT');
-        return claimedIDs;
+        return { workflowIds: claimedIDs };
       }
 
       if (queue.rateLimit !== undefined) {
@@ -3980,7 +4012,7 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
       }
       if (maxTasks <= 0) {
         await client.query('COMMIT');
-        return claimedIDs;
+        return { workflowIds: claimedIDs };
       }
 
       if (queue.concurrency !== undefined) {
@@ -4005,7 +4037,7 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
       // Return immediately if there are no available tasks due to flow control limits
       if (maxTasks <= 0) {
         await client.query('COMMIT');
-        return claimedIDs;
+        return { workflowIds: claimedIDs };
       }
 
       // Retrieve the first max_tasks workflows in the queue.
@@ -4091,7 +4123,7 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
     }
 
     // Return the IDs of all functions we marked started
-    return claimedIDs;
+    return { workflowIds: claimedIDs };
   }
 
   /** Max heads admitted per sweep: bounds dispatch, not the partition walk; an unconstrained sweep takes the lowest keys, so higher keys can wait under sustained load. */
@@ -4104,7 +4136,8 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
     executorID: string,
     appVersion: string,
     maxTasks: number = Infinity,
-  ): Promise<string[]> {
+    _claimScope?: ClaimScope,
+  ): Promise<ClaimResult> {
     if (
       queue.partitionConcurrency !== 1 ||
       queue.concurrency !== undefined ||
@@ -4189,7 +4222,7 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
       const candidateIDs = candidateResult.rows.map((row) => row.workflow_uuid);
       if (candidateIDs.length === 0) {
         await client.query('COMMIT');
-        return [];
+        return { workflowIds: [] };
       }
       await debugTriggerPoint(DEBUG_TRIGGER_PARTITIONED_DEQUEUE_AFTER_CANDIDATES);
 
@@ -4217,7 +4250,7 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
       const claimIDs = candidateIDs.filter((id) => lockedIDs.has(id));
       if (claimIDs.length === 0) {
         await client.query('COMMIT');
-        return [];
+        return { workflowIds: [] };
       }
 
       const flipParams: unknown[] = [
@@ -4259,7 +4292,7 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
       if (claimedIDs.length > 0) {
         this.logger.debug(`[${queue.name}] dequeueing ${claimedIDs.length} task(s)`);
       }
-      return claimedIDs;
+      return { workflowIds: claimedIDs };
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;

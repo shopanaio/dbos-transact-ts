@@ -79,3 +79,6 @@ export type {
   ExportedWorkflow,
 } from './system_database';
 export { getSystemDatabaseExecutionContext } from './context';
+
+export type { ClaimScope, ClaimResult, QueueHint, HintOutcome, QueueWakeupSource } from './system_database';
+export { QueueUnavailableError } from './system_database';

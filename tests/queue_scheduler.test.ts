@@ -36,8 +36,12 @@ describe('batch queue scheduler', () => {
       findQueuesWithEnqueuedWorkflows: jest.fn(
         async (_requests: QueueReadinessRequest[], _version: string): Promise<QueueReadinessRequest[]> => [],
       ),
-      findAndMarkStartableWorkflows: jest.fn(async (_queue: WorkflowQueue): Promise<string[]> => []),
-      findAndMarkStartablePartitionedWorkflows: jest.fn(async (_queue: WorkflowQueue): Promise<string[]> => []),
+      findAndMarkStartableWorkflows: jest.fn(async (_queue: WorkflowQueue): Promise<{ workflowIds: string[] }> => ({
+        workflowIds: [],
+      })),
+      findAndMarkStartablePartitionedWorkflows: jest.fn(
+        async (_queue: WorkflowQueue): Promise<{ workflowIds: string[] }> => ({ workflowIds: [] }),
+      ),
       countRunningWorkflowsForQueue: jest.fn(() => running),
       countRunningWorkflowsForPartition: jest.fn(() => 0),
       getQueuePartitions: jest.fn(async () => ['p1', 'p2', 'p3']),
@@ -196,7 +200,7 @@ describe('batch queue scheduler', () => {
   test('SC-qp07: ready queues preserve fairness and occupy lanes until dispatch finishes', async () => {
     records = [record('a'), record('b'), record('c')];
     ready();
-    db.findAndMarkStartableWorkflows.mockImplementation(async (q) => [q.name]);
+    db.findAndMarkStartableWorkflows.mockImplementation(async (q) => ({ workflowIds: [q.name] }));
     const dispatch = gate<void>(undefined);
     jest.mocked(exec.dispatchDequeuedWorkflows).mockReturnValueOnce(dispatch.promise);
     await start(1);
@@ -240,7 +244,7 @@ describe('batch queue scheduler', () => {
     'SC-qp07: committed claim survives %s and shutdown drains dispatch',
     async (change) => {
       ready();
-      const claim = gate<string[]>([]);
+      const claim = gate<{ workflowIds: string[] }>({ workflowIds: [] });
       const dispatch = gate<void>(undefined);
       db.findAndMarkStartableWorkflows.mockReturnValueOnce(claim.promise);
       jest.mocked(exec.dispatchDequeuedWorkflows).mockReturnValueOnce(dispatch.promise);
@@ -257,7 +261,7 @@ describe('batch queue scheduler', () => {
       void loop!.then(() => {
         ended = true;
       });
-      claim.resolve(['accepted']);
+      claim.resolve({ workflowIds: ['accepted'] });
       await advance();
       expect(exec.dispatchDequeuedWorkflows).toHaveBeenCalledWith(['accepted']);
       expect(ended).toBe(false);
@@ -387,7 +391,7 @@ describe('batch queue scheduler', () => {
   test('SC-qp07: wake during claim preserves immediate poll and resets contention backoff once', async () => {
     ready();
     db.findAndMarkStartableWorkflows.mockRejectedValueOnce(Object.assign(new Error('contention'), { code: '40001' }));
-    const claim = gate<string[]>([]);
+    const claim = gate<{ workflowIds: string[] }>({ workflowIds: [] });
     db.findAndMarkStartableWorkflows.mockReturnValueOnce(claim.promise);
     await start();
     await advance(300);
@@ -398,7 +402,7 @@ describe('batch queue scheduler', () => {
     records[0].paused = false;
     hint('a');
     await advance();
-    claim.resolve([]);
+    claim.resolve({ workflowIds: [] });
     await advance();
     expect(db.findAndMarkStartableWorkflows).toHaveBeenCalledTimes(3);
     // Positive readiness must not scale the interval down a second time.
@@ -430,7 +434,7 @@ describe('batch queue scheduler', () => {
     'SC-qp07: %s failure releases an obsolete claim reservation and lane',
     async (failure) => {
       ready();
-      const claim = gate<string[]>([]);
+      const claim = gate<{ workflowIds: string[] }>({ workflowIds: [] });
       db.findAndMarkStartableWorkflows.mockReturnValueOnce(claim.promise);
       if (failure === 'dispatch')
         jest.mocked(exec.dispatchDequeuedWorkflows).mockRejectedValueOnce(new Error('dispatch failed'));
@@ -440,7 +444,7 @@ describe('batch queue scheduler', () => {
       hint('a');
       await advance();
       if (failure === 'rollback') claim.reject(new Error('rolled back'));
-      else claim.resolve(['committed']);
+      else claim.resolve({ workflowIds: ['committed'] });
       await advance();
       expect(db.findAndMarkStartableWorkflows).toHaveBeenCalledTimes(2);
       expect(exec.logger.warn).toHaveBeenCalledTimes(1);

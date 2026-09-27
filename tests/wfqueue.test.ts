@@ -3055,9 +3055,9 @@ describe('bounded-lane dispatcher', () => {
         },
         findAndMarkStartableWorkflows: async (queue: WorkflowQueue) => {
           // An earlier DBOS.launch() registered the internal queue globally; skip it to keep counters clean.
-          if (queue.name === INTERNAL_QUEUE_NAME) return [];
+          if (queue.name === INTERNAL_QUEUE_NAME) return { workflowIds: [] };
           await hooks.onPoll?.(queue.name);
-          return [];
+          return { workflowIds: [] };
         },
       },
     } as unknown as DBOSExecutor;
@@ -3372,7 +3372,9 @@ describe('[postgres-only] partitioned-batch-dequeue', () => {
   }
 
   function sweep(queue: WorkflowQueue, executorID: string = 'local'): Promise<string[]> {
-    return sysdb.findAndMarkStartablePartitionedWorkflows(queue, executorID, globalParams.appVersion);
+    return sysdb
+      .findAndMarkStartablePartitionedWorkflows(queue, executorID, globalParams.appVersion)
+      .then((result) => result.workflowIds);
   }
 
   // Workflow IDs sort in enqueue order, so a created_at tie still ranks the rows as enqueued.
@@ -3969,6 +3971,7 @@ describe('[postgres-only] limiter-dequeue-locking', () => {
           partitions.map((partition, index) =>
             sysdb
               .findAndMarkStartableWorkflows(queue, `executor-${index}`, parkedVersion, partition, 0, 0)
+              .then((result) => result.workflowIds)
               // Losing the race is the correct outcome; admitting is not.
               .catch(() => [] as string[]),
           ),
