@@ -1,6 +1,6 @@
 import { PostgresSystemDatabase } from '../src/system_database';
 import { withTestClientDatabase } from './system-database-factory';
-import { Client } from 'pg';
+import { openWorkflowState, type OwnedTable, type WorkflowStateAccess } from './system-database-state';
 import { DBOS, DBOSClient, StatusString } from '../src';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
 import { garbageCollect, globalTimeout } from '../src/workflow_management';
@@ -14,29 +14,24 @@ type NoArgWorkflow = () => Promise<unknown>;
 const APP = 'appname-test-app';
 const PEER = 'appname-test-peer';
 
-async function sysdbClient(config: DBOSConfig): Promise<Client> {
-  const client = new Client({ connectionString: config.systemDatabaseUrl });
-  await client.connect();
-  return client;
-}
-
-async function ownerOf(client: Client, table: string, keyColumn: string, key: string): Promise<string | null> {
-  const { rows } = await client.query<{ application_name: string | null }>(
-    `SELECT application_name FROM dbos.${table} WHERE ${keyColumn} = $1`,
-    [key],
-  );
-  return rows[0]?.application_name ?? null;
+async function ownerOf(
+  state: WorkflowStateAccess,
+  table: OwnedTable,
+  _keyColumn: string,
+  key: string,
+): Promise<string | null> {
+  return state.ownerOf(table, key);
 }
 
 /** Insert a step row as though a peer application had recorded it. */
 async function insertPeerStep(
-  client: Client,
+  client: WorkflowStateAccess,
   workflowID: string,
   functionName: string,
   options: { applicationName?: string | null } = {},
 ): Promise<void> {
   const owner = 'applicationName' in options ? options.applicationName : PEER;
-  await client.query(
+  await client.sql().query(
     `INSERT INTO dbos.operation_outputs
        (workflow_uuid, function_id, function_name, output, serialization, completed_at_epoch_ms, application_name)
      VALUES ($1, 0, $2, '1', 'portable_json', $3, $4)`,
@@ -46,7 +41,7 @@ async function insertPeerStep(
 
 /** Insert a workflow row as though a peer application had enqueued it. */
 async function insertPeerWorkflow(
-  client: Client,
+  client: WorkflowStateAccess,
   id: string,
   options: {
     queueName?: string;
@@ -63,7 +58,7 @@ async function insertPeerWorkflow(
   const completedAt = 'completedAt' in options ? options.completedAt : terminal ? now : null;
   // An explicit null means unclaimed, which `??` would otherwise swallow.
   const owner = 'applicationName' in options ? options.applicationName : PEER;
-  await client.query(
+  await client.sql().query(
     `INSERT INTO dbos.workflow_status
        (workflow_uuid, status, name, queue_name, executor_id, application_id, created_at, updated_at,
         completed_at, recovery_attempts, priority, inputs, serialization, application_name)
@@ -74,19 +69,19 @@ async function insertPeerWorkflow(
 
 describe('application-name', () => {
   let config: DBOSConfig;
-  let client: Client;
+  let client: WorkflowStateAccess;
 
   beforeEach(async () => {
     config = generateDBOSTestConfig();
     config.name = APP;
     await setUpDBOSTestSysDb(config);
     DBOS.setConfig(config);
-    client = await sysdbClient(config);
+    client = await openWorkflowState(config);
   });
 
   afterEach(async () => {
     await DBOS.shutdown();
-    await client.end();
+    await client.close();
   });
 
   test('runtime stamps everything it writes with its application name', async () => {
@@ -111,13 +106,10 @@ describe('application-name', () => {
     expect(await ownerOf(client, 'workflow_status', 'workflow_uuid', handle.workflowID)).toBe(APP);
 
     // Steps carry the owner too, denormalized so step observability filters without a join.
-    const { rows: steps } = await client.query<{ application_name: string | null }>(
-      `SELECT application_name FROM dbos.operation_outputs WHERE workflow_uuid = $1`,
-      [handle.workflowID],
-    );
+    const steps = await client.stepOwners(handle.workflowID);
     expect(steps.length).toBeGreaterThan(0);
     for (const step of steps) {
-      expect(step.application_name).toBe(APP);
+      expect(step).toBe(APP);
     }
 
     // The application version this launch registered is owned as well.
@@ -331,7 +323,7 @@ describe('application-name', () => {
       ['appname-peer-schedule-id', 'appname-theirs', PEER],
       ['appname-legacy-schedule-id', 'appname-unclaimed', null],
     ] as const) {
-      await client.query(
+      await client.sql().query(
         `INSERT INTO dbos.workflow_schedules (schedule_id, schedule_name, workflow_name, schedule, status, context, application_name)
          VALUES ($1, $2, 'scheduled', '0 0 1 1 *', 'ACTIVE', $4, $3)`,
         [scheduleID, name, owner, DBOSJSON.stringify(null)],
@@ -341,7 +333,7 @@ describe('application-name', () => {
       ['appname-theirs-queue', PEER],
       ['appname-unclaimed-queue', null],
     ] as const) {
-      await client.query(`INSERT INTO dbos.queues (name, application_name) VALUES ($1, $2)`, [name, owner]);
+      await client.sql().query(`INSERT INTO dbos.queues (name, application_name) VALUES ($1, $2)`, [name, owner]);
     }
 
     const scheduleNames = async (applicationName?: string) =>
@@ -385,9 +377,11 @@ describe('application-name', () => {
     ]);
     expect(await ownerOf(client, 'queues', 'name', 'appname-unclaimed-queue')).toBe(APP);
     expect(await ownerOf(client, 'workflow_schedules', 'schedule_name', 'appname-unclaimed')).toBe(APP);
-    const { rows: scheduleRows } = await client.query<{ schedule_id: string }>(
-      `SELECT schedule_id FROM dbos.workflow_schedules WHERE schedule_name = 'appname-unclaimed'`,
-    );
+    const { rows: scheduleRows } = await client
+      .sql()
+      .query<{ schedule_id: string }>(
+        `SELECT schedule_id FROM dbos.workflow_schedules WHERE schedule_name = 'appname-unclaimed'`,
+      );
     expect(scheduleRows.map((r) => r.schedule_id)).toEqual(['appname-legacy-schedule-id']);
   });
 
@@ -428,9 +422,11 @@ describe('application-name', () => {
     expect(await ownerOf(client, 'workflow_status', 'workflow_uuid', unclaimedID)).toBe(APP);
 
     // The peer's row is untouched: still ENQUEUED, still theirs.
-    const { rows } = await client.query<{ status: string; application_name: string }>(
-      `SELECT status, application_name FROM dbos.workflow_status WHERE workflow_uuid = 'appname-dequeue-peer'`,
-    );
+    const { rows } = await client
+      .sql()
+      .query<{ status: string; application_name: string }>(
+        `SELECT status, application_name FROM dbos.workflow_status WHERE workflow_uuid = 'appname-dequeue-peer'`,
+      );
     expect(rows[0].status).toBe(StatusString.ENQUEUED);
     expect(rows[0].application_name).toBe(PEER);
   });
@@ -453,16 +449,20 @@ describe('application-name', () => {
 
     // Retention spans every application, so the peer's old terminal row goes along with ours.
     await garbageCollect(DBOSExecutor.globalInstance!.systemDatabase, cutoffPastAllCompletions(), undefined);
-    const collected = await client.query(`SELECT 1 FROM dbos.workflow_status WHERE workflow_uuid = ANY($1)`, [
-      ['appname-gc-peer', mine.workflowID],
-    ]);
+    const collected = await client
+      .sql()
+      .query(`SELECT 1 FROM dbos.workflow_status WHERE workflow_uuid = ANY($1)`, [
+        ['appname-gc-peer', mine.workflowID],
+      ]);
     expect(collected.rowCount).toBe(0);
 
     // Timing out cancels running work, so it stays scoped: a peer's in-flight workflow is left alone.
     await globalTimeout(DBOSExecutor.globalInstance!.systemDatabase, Date.now());
-    const { rows } = await client.query<{ status: string }>(
-      `SELECT status FROM dbos.workflow_status WHERE workflow_uuid = 'appname-gc-peer-pending'`,
-    );
+    const { rows } = await client
+      .sql()
+      .query<{ status: string }>(
+        `SELECT status FROM dbos.workflow_status WHERE workflow_uuid = 'appname-gc-peer-pending'`,
+      );
     expect(rows[0].status).toBe(StatusString.PENDING);
   });
 
@@ -476,11 +476,12 @@ describe('application-name', () => {
       applicationName: PEER,
     }).then((options) => DBOSClient.create(options));
     try {
-      await client.query(
-        `INSERT INTO dbos.application_versions (version_id, version_name, version_timestamp, application_name)
-         VALUES ($1, 'peer-version', $2, $3)`,
-        ['peer-version-id', Date.now() + 100_000, PEER],
-      );
+      await client.insertVersion({
+        versionId: 'peer-version-id',
+        versionName: 'peer-version',
+        timestamp: Date.now() + 100_000,
+        applicationName: PEER,
+      });
 
       const latest = await DBOS.getLatestApplicationVersion();
       expect(latest.versionName).toBe(ourVersion);

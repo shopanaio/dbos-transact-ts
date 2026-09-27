@@ -1,6 +1,7 @@
 import { withTestClientDatabase } from './system-database-factory';
 import { WorkflowHandle, DBOS, DBOSSerializer } from '../src/';
 import { generateDBOSTestConfig, setUpDBOSTestSysDb, Event } from './helpers';
+import { openWorkflowState } from './system-database-state';
 import { randomUUID } from 'node:crypto';
 import { StatusString } from '../src/workflow';
 import { DBOSConfig } from '../src/dbos-executor';
@@ -41,22 +42,15 @@ describe('dbos-tests', () => {
   });
 
   test('simple-workflow-attempts-counter', async () => {
-    const systemDBClient = new Client({
-      connectionString: config.systemDatabaseUrl,
-    });
+    const state = await openWorkflowState(config);
     try {
-      await systemDBClient.connect();
       const handle = await DBOS.startWorkflow(DBOSTestClass).noopWorkflow();
       for (let i = 0; i < 10; i++) {
         await DBOS.startWorkflow(DBOSTestClass, { workflowID: handle.workflowID }).noopWorkflow();
-        const result = await systemDBClient.query<{ status: string; attempts: number }>(
-          `SELECT status, recovery_attempts as attempts FROM dbos.workflow_status WHERE workflow_uuid=$1`,
-          [handle.workflowID],
-        );
-        expect(result.rows[0].attempts).toBe(String(1));
+        expect(await state.readRecoveryAttempts(handle.workflowID)).toBe(1);
       }
     } finally {
-      await systemDBClient.end();
+      await state.close();
     }
   });
 
@@ -1061,7 +1055,7 @@ describe('timeout-options-tests', () => {
   });
 });
 
-describe('custom-pool-test', () => {
+describe('custom-pool-test [postgres-only]', () => {
   afterEach(async () => {
     await DBOS.shutdown();
   });
@@ -1135,7 +1129,7 @@ describe('custom-pool-test', () => {
   });
 });
 
-describe('custom-pool-lifecycle', () => {
+describe('custom-pool-lifecycle [postgres-only]', () => {
   let config: DBOSConfig;
   let systemDatabaseUrl: string;
 
@@ -1272,7 +1266,7 @@ describe('custom-pool-lifecycle', () => {
   });
 });
 
-describe('run-migrations-flag', () => {
+describe('run-migrations-flag [postgres-only]', () => {
   let config: DBOSConfig;
   // A throwaway system database, so a failed verification never touches the shared test one.
   let unmigratedUrl: string;

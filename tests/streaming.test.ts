@@ -823,7 +823,7 @@ describe('dbos-streaming-tests', () => {
     expect(joined.length).toBe(n + 1);
   });
 
-  test('stream-notifier-drops-unsendable-payload', async () => {
+  test('[postgres-only] stream-notifier-drops-unsendable-payload', async () => {
     // A rejected batch (e.g. a payload over the 8000-byte limit) is dropped, not requeued, so a poison payload can't permanently stall the notifier.
     await DBOS.launch();
     const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
@@ -868,7 +868,7 @@ describe('dbos-streaming-tests', () => {
     }
   });
 
-  test('stream-notifier-survives-flush-error', async () => {
+  test('[postgres-only] stream-notifier-survives-flush-error', async () => {
     // An exception escaping a flush must not kill the notifier loop; it logs, backs off, and resumes delivering.
     await DBOS.launch();
     const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;

@@ -1,6 +1,5 @@
 import { PostgresSystemDatabase } from '../src/system_database';
 import { randomUUID } from 'node:crypto';
-import { Client } from 'pg';
 
 import { InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { context, SpanStatusCode, trace } from '@opentelemetry/api';
@@ -17,6 +16,7 @@ import { serializeResError, serializeValue } from '../src/serialization';
 import { sleepms } from '../src/utils';
 import { Event, generateDBOSTestConfig, retryUntilSuccess, setUpDBOSTestSysDb } from './helpers';
 import { NodeTracerProvider } from './nodetraceprovider';
+import { openWorkflowState, type WorkflowStateAccess } from './system-database-state';
 
 // Each run blocks until the test has rewritten its row, then returns a
 // result the test can tell apart from anything recorded out-of-band.
@@ -132,23 +132,12 @@ async function encodeError(message: string) {
 // Take the row away from the blocked run, standing in for the concurrent
 // resume/recovery/cancel that would do it in production.
 async function rewriteRowWith(
-  client: Client,
+  state: WorkflowStateAccess,
   workflowID: string,
   status: (typeof StatusString)[keyof typeof StatusString],
   fields: { output?: string | null; error?: string | null; serialization?: string | null } = {},
 ) {
-  await client.query(
-    `UPDATE dbos.workflow_status
-     SET status=$1, output=$2, error=$3, serialization=COALESCE($4, serialization)
-     WHERE workflow_uuid=$5`,
-    [status, fields.output ?? null, fields.error ?? null, fields.serialization ?? null, workflowID],
-  );
-  // Both destinations, as the execution that really recorded this outcome would have.
-  await client.query(
-    `INSERT INTO dbos.workflow_output (workflow_uuid, output, error) VALUES ($1, $2, $3)
-     ON CONFLICT (workflow_uuid) DO UPDATE SET output = EXCLUDED.output, error = EXCLUDED.error`,
-    [workflowID, fields.output ?? null, fields.error ?? null],
-  );
+  await state.rewriteOutcome(workflowID, status, fields);
 }
 
 /**
@@ -157,30 +146,18 @@ async function rewriteRowWith(
  * the legacy column the rewrite also filled.
  */
 async function readOutcome(
-  client: Client,
+  state: WorkflowStateAccess,
   workflowID: string,
 ): Promise<{ status: string; output: string | null; error: string | null }> {
-  const { rows } = await client.query<{ status: string; output: string | null; error: string | null }>(
-    `SELECT ws.status, wo.output, wo.error
-     FROM dbos.workflow_status ws
-     LEFT JOIN dbos.workflow_output wo ON wo.workflow_uuid = ws.workflow_uuid
-     WHERE ws.workflow_uuid=$1`,
-    [workflowID],
-  );
-  return rows[0];
+  return state.readOutcome(workflowID);
 }
 
 // Plant the checkpoint the blocked step is about to write, with a different
 // completion time so the step's own write is refused as a conflict. Stands in
 // for the concurrent execution that would have written it in production.
-async function plantConflictingCheckpoint(client: Client, workflowID: string, stepID: number | undefined) {
+async function plantConflictingCheckpoint(state: WorkflowStateAccess, workflowID: string, stepID: number | undefined) {
   expect(stepID).toBeDefined();
-  await client.query(
-    `INSERT INTO dbos.operation_outputs
-       (workflow_uuid, function_id, function_name, started_at_epoch_ms, completed_at_epoch_ms)
-     VALUES ($1, $2, 'blockedStep', 1, 1)`,
-    [workflowID, stepID],
-  );
+  await state.plantStepCheckpoint(workflowID, stepID!, 'blockedStep');
 }
 
 // A run may record its outcome only while its workflow_status row is still
@@ -191,7 +168,7 @@ async function plantConflictingCheckpoint(client: Client, workflowID: string, st
 // outcome.
 describe('workflow-outcome-ownership', () => {
   let config: DBOSConfig;
-  let systemDBClient: Client;
+  let systemDBClient: WorkflowStateAccess;
 
   beforeAll(async () => {
     config = generateDBOSTestConfig();
@@ -201,12 +178,11 @@ describe('workflow-outcome-ownership', () => {
 
   beforeEach(async () => {
     await DBOS.launch();
-    systemDBClient = new Client({ connectionString: config.systemDatabaseUrl });
-    await systemDBClient.connect();
+    systemDBClient = await openWorkflowState(config);
   });
 
   afterEach(async () => {
-    await systemDBClient.end();
+    await systemDBClient.close();
     await DBOS.shutdown();
   });
 
@@ -292,10 +268,7 @@ describe('workflow-outcome-ownership', () => {
     const { handle, ctrl } = await startBlockedRun();
     await rewriteRow(handle.workflowID, StatusString.MAX_RECOVERY_ATTEMPTS_EXCEEDED);
     // A dead-lettered row carries an exhausted retry budget.
-    await systemDBClient.query(`UPDATE dbos.workflow_status SET recovery_attempts=$1 WHERE workflow_uuid=$2`, [
-      100,
-      handle.workflowID,
-    ]);
+    await systemDBClient.setRecoveryAttempts(handle.workflowID, 100);
     ctrl.release.set();
 
     // A dead-lettered workflow must not report a completion.
@@ -309,7 +282,7 @@ describe('workflow-outcome-ownership', () => {
 
   test('deleted-row-fails-the-run-with-non-existent-workflow', async () => {
     const { handle, ctrl } = await startBlockedRun();
-    await systemDBClient.query(`DELETE FROM dbos.workflow_status WHERE workflow_uuid=$1`, [handle.workflowID]);
+    await systemDBClient.deleteWorkflowStatus(handle.workflowID);
     ctrl.release.set();
 
     // A run whose row vanished must not report a completion.
@@ -444,7 +417,7 @@ describe('workflow-outcome-ownership', () => {
     // refused error write leaves the run parking on a row it knows existed, so
     // a missing row must not be read as "not inserted yet" and polled forever.
     const { handle, ctrl } = await startBlockedRun('throwingWorkflow');
-    await systemDBClient.query(`DELETE FROM dbos.workflow_status WHERE workflow_uuid=$1`, [handle.workflowID]);
+    await systemDBClient.deleteWorkflowStatus(handle.workflowID);
     ctrl.release.set();
 
     await expect(handle.getResult()).rejects.toThrow(DBOSNonExistentWorkflowError);
@@ -486,7 +459,7 @@ describe('workflow-outcome-ownership', () => {
 // parking.
 describe('workflow-outcome-ownership-spans', () => {
   let config: DBOSConfig;
-  let systemDBClient: Client;
+  let systemDBClient: WorkflowStateAccess;
   const memoryExporter = new InMemorySpanExporter();
 
   beforeAll(() => {
@@ -509,12 +482,11 @@ describe('workflow-outcome-ownership-spans', () => {
   beforeEach(async () => {
     memoryExporter.reset();
     await DBOS.launch();
-    systemDBClient = new Client({ connectionString: config.systemDatabaseUrl });
-    await systemDBClient.connect();
+    systemDBClient = await openWorkflowState(config);
   });
 
   afterEach(async () => {
-    await systemDBClient.end();
+    await systemDBClient.close();
     await DBOS.shutdown();
   });
 

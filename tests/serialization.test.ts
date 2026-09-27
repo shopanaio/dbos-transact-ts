@@ -1,17 +1,9 @@
 import { PostgresSystemDatabase } from '../src/system_database';
 import { withTestClientDatabase } from './system-database-factory';
-import { Client } from 'pg';
 import { DBOS, DBOSClient, DBOSConfig, DBOSSerializer, WorkflowHandle } from '../src';
 import { generateDBOSTestConfig, reexecuteWorkflowById, setUpDBOSTestSysDb } from './helpers';
-import {
-  JsonWorkflowArgs,
-  notifications,
-  PortableWorkflowError,
-  streams,
-  workflow_events,
-  workflow_events_history,
-  workflow_status,
-} from '../schemas/system_db_schema';
+import { JsonWorkflowArgs, PortableWorkflowError } from '../schemas/system_db_schema';
+import { openWorkflowState, type WorkflowStateAccess } from './system-database-state';
 import { DBOSJSON, DBOSPortableJSON, SERIALIZER_MARKER_KEY, SERIALIZER_MARKER_VALUE } from '../src/serialization';
 import { randomUUID } from 'node:crypto';
 import { DBOSExecutor } from '../src/dbos-executor';
@@ -376,23 +368,14 @@ const portableRecvWF = DBOS.registerWorkflow(
  * A status row with its payloads resolved from the split tables, falling back to the legacy
  * columns: the shape every reader in the SDK sees, whether or not dual write is on.
  */
-async function readStatusRow(client: Client, workflowID: string | undefined) {
-  return client.query<workflow_status>(
-    `SELECT ws.workflow_uuid, ws.status, ws.serialization,
-            COALESCE(wi.inputs, ws.inputs) AS inputs,
-            COALESCE(wo.output, ws.output) AS output,
-            COALESCE(wo.error, ws.error) AS error
-     FROM dbos.workflow_status ws
-     LEFT JOIN dbos.workflow_input wi ON wi.workflow_uuid = ws.workflow_uuid
-     LEFT JOIN dbos.workflow_output wo ON wo.workflow_uuid = ws.workflow_uuid
-     WHERE ws.workflow_uuid = $1`,
-    [workflowID],
-  );
+async function readStatusRow(state: WorkflowStateAccess, workflowID: string | undefined) {
+  const row = await state.readWorkflowRow(workflowID!);
+  return { rows: row ? [row] : [] };
 }
 
 describe('portable-serialization-tests', () => {
   let config: DBOSConfig;
-  let systemDBClient: Client;
+  let systemDBClient: WorkflowStateAccess;
 
   beforeAll(() => {
     config = generateDBOSTestConfig();
@@ -405,45 +388,30 @@ describe('portable-serialization-tests', () => {
     await DBOS.launch();
     await DBOS.registerQueue('testq', { onConflict: 'always_update' });
 
-    systemDBClient = new Client({
-      connectionString: config.systemDatabaseUrl,
-    });
-    await systemDBClient.connect();
+    systemDBClient = await openWorkflowState(config);
   });
 
   afterEach(async () => {
-    await systemDBClient.end();
+    await systemDBClient.close();
     await DBOS.shutdown();
     process.env.DBOS__APPVERSION = undefined;
   });
 
   async function checkMsgSer(dstdid: string, topic: string, ser: string) {
-    const mser = await systemDBClient.query<notifications>(
-      `SELECT * FROM dbos.notifications where destination_uuid = $1 and topic=$2;`,
-      [dstdid, topic],
-    );
-    expect(mser.rows[0].serialization).toBe(ser);
+    const mser = await systemDBClient.readStoredValues('notification', dstdid, topic);
+    expect(mser[0].serialization).toBe(ser);
   }
 
   async function checkEvtSer(wfid: string, key: string, ser: string) {
-    const eser = await systemDBClient.query<workflow_events>(
-      `SELECT * FROM dbos.workflow_events where workflow_uuid = $1 and key=$2;`,
-      [wfid, key],
-    );
-    expect(eser.rows[0].serialization).toBe(ser);
-    const hser = await systemDBClient.query<workflow_events_history>(
-      `SELECT * FROM dbos.workflow_events_history where workflow_uuid = $1 and key=$2;`,
-      [wfid, key],
-    );
-    expect(hser.rows[0].serialization).toBe(ser);
+    const eser = await systemDBClient.readStoredValues('event', wfid, key);
+    expect(eser[0].serialization).toBe(ser);
+    const hser = await systemDBClient.readStoredValues('event_history', wfid, key);
+    expect(hser[0].serialization).toBe(ser);
   }
 
   async function checkStreamSer(wfid: string, key: string, ser: string) {
-    const mser = await systemDBClient.query<streams>(
-      `SELECT * FROM dbos.streams where workflow_uuid = $1 and key=$2;`,
-      [wfid, key],
-    );
-    expect(mser.rows[0].serialization).toBe(ser);
+    const mser = await systemDBClient.readStoredValues('stream', wfid, key);
+    expect(mser[0].serialization).toBe(ser);
   }
 
   test('test-explicit-ser', async () => {
@@ -589,12 +557,9 @@ describe('portable-serialization-tests', () => {
       await closeStreamWorkflow();
     });
 
-    const rows = await systemDBClient.query<streams>(
-      `SELECT * FROM dbos.streams where workflow_uuid = $1 and key=$2 ORDER BY "offset";`,
-      [wfid, 'closedstream'],
-    );
-    expect(rows.rows.map((row) => row.value)).toEqual(['{"stream":"OhYeah"}', '"__DBOS_STREAM_CLOSED__"']);
-    expect(rows.rows.map((row) => row.serialization)).toEqual([DBOSPortableJSON.name(), DBOSPortableJSON.name()]);
+    const rows = await systemDBClient.readStoredValues('stream', wfid, 'closedstream');
+    expect(rows.map((row) => row.value)).toEqual(['{"stream":"OhYeah"}', '"__DBOS_STREAM_CLOSED__"']);
+    expect(rows.map((row) => row.serialization)).toEqual([DBOSPortableJSON.name(), DBOSPortableJSON.name()]);
   });
 
   test('test-portable-direct-invocation', async () => {
@@ -617,11 +582,8 @@ describe('portable-serialization-tests', () => {
     const handle = await DBOS.startWorkflow(reSetEventWorkflow)();
     await handle.getResult();
 
-    const row = await systemDBClient.query<workflow_events>(
-      `SELECT * FROM dbos.workflow_events WHERE workflow_uuid = $1 AND key = $2`,
-      [handle.workflowID, 'rekey'],
-    );
-    expect(row.rows[0].serialization).toBe(DBOSJSON.name());
+    const row = await systemDBClient.readStoredValues('event', handle.workflowID, 'rekey');
+    expect(row[0].serialization).toBe(DBOSJSON.name());
 
     expect(await DBOS.getEvent(handle.workflowID, 'rekey')).toBe(10n);
   });
@@ -641,7 +603,7 @@ describe('portable-serialization-tests', () => {
 
     // Also test via queue (simulating enqueue_workflow from pl/pgSQL)
     const queuedId = randomUUID();
-    await systemDBClient.query(
+    await systemDBClient.sql().query(
       `INSERT INTO dbos.workflow_status(
         workflow_uuid, name, class_name, queue_name,
         status, inputs, created_at, serialization
@@ -677,7 +639,7 @@ describe('portable-serialization-tests', () => {
 
     // Also test via queue (simulating enqueue_workflow from pl/pgSQL)
     const queuedId = randomUUID();
-    await systemDBClient.query(
+    await systemDBClient.sql().query(
       `INSERT INTO dbos.workflow_status(
         workflow_uuid, name, class_name, queue_name,
         status, inputs, created_at, serialization
@@ -701,7 +663,7 @@ describe('portable-serialization-tests', () => {
 
   test('test-direct-insert', async () => {
     const id = randomUUID();
-    await systemDBClient.query(
+    await systemDBClient.sql().query(
       `
       INSERT INTO dbos.workflow_status(
         workflow_uuid,
@@ -727,7 +689,7 @@ describe('portable-serialization-tests', () => {
       ],
     );
 
-    await systemDBClient.query(
+    await systemDBClient.sql().query(
       `
       INSERT INTO dbos.notifications(
         destination_uuid,
@@ -749,7 +711,7 @@ describe('portable-serialization-tests', () => {
   test('test-invalid-json-input', async () => {
     // Insert a workflow with unparseable JSON in the inputs column
     const id = randomUUID();
-    await systemDBClient.query(
+    await systemDBClient.sql().query(
       `
       INSERT INTO dbos.workflow_status(
         workflow_uuid, name, class_name, queue_name,
@@ -778,7 +740,7 @@ describe('portable-serialization-tests', () => {
     // simplePortWorkflow expects (s: string, x: number, o: {k: string, v: string[]})
     // We provide [123, "not_a_number", "not_an_object"].
     const id = randomUUID();
-    await systemDBClient.query(
+    await systemDBClient.sql().query(
       `
       INSERT INTO dbos.workflow_status(
         workflow_uuid, name, class_name, queue_name,
@@ -814,7 +776,7 @@ describe('portable-serialization-tests', () => {
     // validatedWorkflow has inputSchema: z.tuple([z.string(), z.number(), z.object({...})])
     // Insert with wrong types — the Zod schema should reject them with a clear error.
     const id = randomUUID();
-    await systemDBClient.query(
+    await systemDBClient.sql().query(
       `
       INSERT INTO dbos.workflow_status(
         workflow_uuid, name, class_name, queue_name,
@@ -849,7 +811,7 @@ describe('portable-serialization-tests', () => {
   test('test-input-schema-valid-input', async () => {
     // validatedWorkflow with correct types — should pass validation and succeed.
     const id = randomUUID();
-    await systemDBClient.query(
+    await systemDBClient.sql().query(
       `
       INSERT INTO dbos.workflow_status(
         workflow_uuid, name, class_name, queue_name,
@@ -879,7 +841,7 @@ describe('portable-serialization-tests', () => {
     // Insert an ISO date string — Zod should coerce it to a Date object.
     const isoDate = '2025-06-15T12:00:00.000Z';
     const id = randomUUID();
-    await systemDBClient.query(
+    await systemDBClient.sql().query(
       `
       INSERT INTO dbos.workflow_status(
         workflow_uuid, name, class_name, queue_name,
@@ -1048,7 +1010,7 @@ describe('custom-serializer-restart-tests', () => {
   };
 
   let config: DBOSConfig;
-  let systemDBClient: Client;
+  let systemDBClient: WorkflowStateAccess | undefined;
 
   beforeAll(() => {
     config = generateDBOSTestConfig();
@@ -1056,7 +1018,8 @@ describe('custom-serializer-restart-tests', () => {
 
   afterEach(async () => {
     if (systemDBClient) {
-      await systemDBClient.end();
+      await systemDBClient.close();
+      systemDBClient = undefined;
     }
     await DBOS.shutdown();
   });
@@ -1069,8 +1032,7 @@ describe('custom-serializer-restart-tests', () => {
     DBOS.setConfig(config);
     await DBOS.launch();
 
-    systemDBClient = new Client({ connectionString: config.systemDatabaseUrl });
-    await systemDBClient.connect();
+    systemDBClient = await openWorkflowState(config);
 
     const p1Handle = await DBOS.startWorkflow(custSerWorkflow)('hello');
     expect(await p1Handle.getResult()).toBe('result:hello');
@@ -1118,11 +1080,8 @@ describe('custom-serializer-restart-tests', () => {
     expect(p2Status.rows[0].serialization).toBe('custom_base64');
     expect(p2Status.rows[0].output).toBe(base64Serializer.stringify('result:world'));
 
-    const p2Evt = await systemDBClient.query<workflow_events>(
-      'SELECT * FROM dbos.workflow_events WHERE workflow_uuid = $1 AND key = $2',
-      [p2Handle.workflowID, 'key'],
-    );
-    expect(p2Evt.rows[0].serialization).toBe('custom_base64');
+    const p2Evt = await systemDBClient.readStoredValues('event', p2Handle.workflowID, 'key');
+    expect(p2Evt[0].serialization).toBe('custom_base64');
 
     process.env.DBOS__APPVERSION = undefined;
   });
@@ -1135,32 +1094,20 @@ describe('custom-serializer-restart-tests', () => {
     DBOS.setConfig(config);
     await DBOS.launch();
 
-    systemDBClient = new Client({ connectionString: config.systemDatabaseUrl });
-    await systemDBClient.connect();
+    systemDBClient = await openWorkflowState(config);
 
     // Insert a default-format (js_superjson) workflow directly for comparison,
     // since we can't run both serializers in one launch
     const defaultWfId = randomUUID();
-    await systemDBClient.query(
-      `INSERT INTO dbos.workflow_status(
-        workflow_uuid, name, class_name, status, output, created_at, serialization
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        defaultWfId,
-        'custSerWorkflow',
-        '',
-        'SUCCESS',
-        DBOSJSON.stringify('result:default'),
-        Date.now(),
-        DBOSJSON.name(),
-      ],
-    );
-    await systemDBClient.query(
-      `INSERT INTO dbos.workflow_events(
-        workflow_uuid, key, value, serialization
-      ) VALUES ($1, $2, $3, $4)`,
-      [defaultWfId, 'key', DBOSJSON.stringify('default'), DBOSJSON.name()],
-    );
+    await systemDBClient.insertFinishedWorkflow({
+      workflowID: defaultWfId,
+      name: 'custSerWorkflow',
+      className: '',
+      status: 'SUCCESS',
+      output: DBOSJSON.stringify('result:default'),
+      serialization: DBOSJSON.name(),
+    });
+    await systemDBClient.insertEvent(defaultWfId, 'key', DBOSJSON.stringify('default'), DBOSJSON.name());
 
     // Run workflows with custom serializer
     const custHandle = await DBOS.startWorkflow(custSerWorkflow)('custom');
@@ -1237,18 +1184,14 @@ describe('custom-serializer-restart-tests', () => {
     DBOS.setConfig(config);
     await DBOS.launch();
 
-    systemDBClient = new Client({ connectionString: config.systemDatabaseUrl });
-    await systemDBClient.connect();
+    systemDBClient = await openWorkflowState(config);
 
     // --- getEvent path ---
     const setter = await DBOS.startWorkflow(portableEventSetterWF)('event-payload');
     await setter.getResult();
     // Sanity check: the event was stored in portable format, not base64.
-    const evtRow = await systemDBClient.query<workflow_events>(
-      `SELECT * FROM dbos.workflow_events WHERE workflow_uuid = $1 AND key = $2`,
-      [setter.workflowID, 'evt'],
-    );
-    expect(evtRow.rows[0].serialization).toBe(DBOSPortableJSON.name());
+    const evtRow = await systemDBClient.readStoredValues('event', setter.workflowID, 'evt');
+    expect(evtRow[0].serialization).toBe(DBOSPortableJSON.name());
 
     const getter = await DBOS.startWorkflow(eventGetterWF)(setter.workflowID);
     expect(await getter.getResult()).toBe('event-payload');
@@ -1345,7 +1288,7 @@ describe('async-serializer-tests', () => {
   };
 
   let config: DBOSConfig;
-  let systemDBClient: Client;
+  let systemDBClient: WorkflowStateAccess | undefined;
 
   beforeAll(() => {
     config = generateDBOSTestConfig();
@@ -1358,7 +1301,8 @@ describe('async-serializer-tests', () => {
 
   afterEach(async () => {
     if (systemDBClient) {
-      await systemDBClient.end();
+      await systemDBClient.close();
+      systemDBClient = undefined;
     }
     await DBOS.shutdown();
   });
@@ -1369,8 +1313,7 @@ describe('async-serializer-tests', () => {
     DBOS.setConfig(config);
     await DBOS.launch();
 
-    systemDBClient = new Client({ connectionString: config.systemDatabaseUrl });
-    await systemDBClient.connect();
+    systemDBClient = await openWorkflowState(config);
 
     // Start a receiver, then run a sender that setEvents and sends to the receiver.
     const receiver = await DBOS.startWorkflow(asyncRecvWorkflow)();
