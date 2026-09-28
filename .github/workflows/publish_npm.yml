@@ -21,7 +21,6 @@ jobs:
             packages/knex-datasource,
             packages/kysely-datasource,
             packages/nodepg-datasource,
-            packages/postgres-datasource,
             packages/prisma-datasource,
             packages/typeorm-datasource,
             packages/otel,
