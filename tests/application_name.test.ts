@@ -30,13 +30,15 @@ async function insertPeerStep(
   functionName: string,
   options: { applicationName?: string | null } = {},
 ): Promise<void> {
-  const owner = 'applicationName' in options ? options.applicationName : PEER;
-  await client.sql().query(
-    `INSERT INTO dbos.operation_outputs
-       (workflow_uuid, function_id, function_name, output, serialization, completed_at_epoch_ms, application_name)
-     VALUES ($1, 0, $2, '1', 'portable_json', $3, $4)`,
-    [workflowID, functionName, Date.now(), owner],
-  );
+  const owner = 'applicationName' in options ? (options.applicationName ?? null) : PEER;
+  await client.insertPeerStep({
+    workflowID,
+    functionID: 0,
+    functionName,
+    output: '1',
+    completedAt: Date.now(),
+    applicationName: owner,
+  });
 }
 
 /** Insert a workflow row as though a peer application had enqueued it. */
@@ -58,13 +60,16 @@ async function insertPeerWorkflow(
   const completedAt = 'completedAt' in options ? options.completedAt : terminal ? now : null;
   // An explicit null means unclaimed, which `??` would otherwise swallow.
   const owner = 'applicationName' in options ? options.applicationName : PEER;
-  await client.sql().query(
-    `INSERT INTO dbos.workflow_status
-       (workflow_uuid, status, name, queue_name, executor_id, application_id, created_at, updated_at,
-        completed_at, recovery_attempts, priority, inputs, serialization, application_name)
-     VALUES ($1, $2, 'peerWorkflow', $3, 'local', '', $4, $4, $5, 0, 0, '{"positionalArgs":[]}', 'portable_json', $6)`,
-    [id, status, options.queueName ?? null, now, completedAt, owner],
-  );
+  await client.insertPeerWorkflow({
+    workflowID: id,
+    status,
+    name: 'peerWorkflow',
+    queueName: options.queueName ?? null,
+    createdAt: now,
+    completedAt: completedAt ?? null,
+    applicationName: owner ?? null,
+    inputs: '{"positionalArgs":[]}',
+  });
 }
 
 describe('application-name', () => {
@@ -323,17 +328,20 @@ describe('application-name', () => {
       ['appname-peer-schedule-id', 'appname-theirs', PEER],
       ['appname-legacy-schedule-id', 'appname-unclaimed', null],
     ] as const) {
-      await client.sql().query(
-        `INSERT INTO dbos.workflow_schedules (schedule_id, schedule_name, workflow_name, schedule, status, context, application_name)
-         VALUES ($1, $2, 'scheduled', '0 0 1 1 *', 'ACTIVE', $4, $3)`,
-        [scheduleID, name, owner, DBOSJSON.stringify(null)],
-      );
+      await client.insertPeerSchedule({
+        scheduleID,
+        scheduleName: name,
+        workflowName: 'scheduled',
+        schedule: '0 0 1 1 *',
+        context: DBOSJSON.stringify(null),
+        applicationName: owner,
+      });
     }
     for (const [name, owner] of [
       ['appname-theirs-queue', PEER],
       ['appname-unclaimed-queue', null],
     ] as const) {
-      await client.sql().query(`INSERT INTO dbos.queues (name, application_name) VALUES ($1, $2)`, [name, owner]);
+      await client.insertPeerQueue(name, owner);
     }
 
     const scheduleNames = async (applicationName?: string) =>
@@ -377,12 +385,7 @@ describe('application-name', () => {
     ]);
     expect(await ownerOf(client, 'queues', 'name', 'appname-unclaimed-queue')).toBe(APP);
     expect(await ownerOf(client, 'workflow_schedules', 'schedule_name', 'appname-unclaimed')).toBe(APP);
-    const { rows: scheduleRows } = await client
-      .sql()
-      .query<{ schedule_id: string }>(
-        `SELECT schedule_id FROM dbos.workflow_schedules WHERE schedule_name = 'appname-unclaimed'`,
-      );
-    expect(scheduleRows.map((r) => r.schedule_id)).toEqual(['appname-legacy-schedule-id']);
+    expect(await client.readScheduleId('appname-unclaimed')).toBe('appname-legacy-schedule-id');
   });
 
   test('dequeue skips another application and claims unclaimed workflows', async () => {
@@ -458,21 +461,13 @@ describe('application-name', () => {
 
     // Retention spans every application, so the peer's old terminal row goes along with ours.
     await garbageCollect(DBOSExecutor.globalInstance!.systemDatabase, cutoffPastAllCompletions(), undefined);
-    const collected = await client
-      .sql()
-      .query(`SELECT 1 FROM dbos.workflow_status WHERE workflow_uuid = ANY($1)`, [
-        ['appname-gc-peer', mine.workflowID],
-      ]);
-    expect(collected.rowCount).toBe(0);
+    for (const id of ['appname-gc-peer', mine.workflowID]) {
+      expect((await client.workflowRows(id)).status).toBe(false);
+    }
 
     // Timing out cancels running work, so it stays scoped: a peer's in-flight workflow is left alone.
     await globalTimeout(DBOSExecutor.globalInstance!.systemDatabase, Date.now());
-    const { rows } = await client
-      .sql()
-      .query<{ status: string }>(
-        `SELECT status FROM dbos.workflow_status WHERE workflow_uuid = 'appname-gc-peer-pending'`,
-      );
-    expect(rows[0].status).toBe(StatusString.PENDING);
+    expect((await client.readStatusColumns('appname-gc-peer-pending', ['status']))?.status).toBe(StatusString.PENDING);
   });
 
   test('versions are per application', async () => {

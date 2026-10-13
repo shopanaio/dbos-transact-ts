@@ -58,6 +58,12 @@ export { QueueControlError, type QueueControlState } from './system_database';
 
 export type {
   SystemDatabase,
+  ObservabilityReadModel,
+  GetWorkflowAggregatesInput,
+  GetStepAggregatesInput,
+  WorkflowAggregateRow,
+  StepAggregateRow,
+  MetricData,
   SystemDatabaseFactory,
   SystemDatabaseContext,
   SystemTransaction,
@@ -90,3 +96,5 @@ export {
 
 export type { ClaimScope, ClaimResult, QueueHint, HintOutcome, QueueWakeupSource } from './system_database';
 export { QueueUnavailableError } from './system_database';
+
+export { queryListWorkflows, queryGetWorkflowAggregates, queryGetStepAggregates, queryGetMetrics } from './system_database';

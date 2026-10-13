@@ -1,4 +1,4 @@
-import { PostgresSystemDatabase } from '../src/system_database';
+import { PostgresSystemDatabase, type ObservabilityReadModel } from '../src/system_database';
 import { inspect } from 'node:util';
 import { AddressInfo } from 'node:net';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -314,6 +314,108 @@ describe('conductor-live-connection', () => {
         expect(answers[0].output).toEqual([expect.objectContaining({ count })]);
       }
     });
+  });
+});
+
+// Observability reads go to SystemDatabase.observability when a backend provides one; commands never do.
+describe('conductor-observability-routing', () => {
+  let config: DBOSConfig;
+  let conductorSocket: WebSocket;
+  let answersTo: (requestID: string) => protocol.BaseResponse[];
+  let shutdown: () => Promise<void>;
+
+  const routedWorkflow = DBOS.registerWorkflow((x: number) => Promise.resolve(x), { name: 'routedWorkflow' });
+
+  beforeAll(() => {
+    config = generateDBOSTestConfig();
+    DBOS.setConfig(config);
+  });
+
+  beforeEach(async () => {
+    await setUpDBOSTestSysDb(config);
+    ({ conductorSocket, answersTo, shutdown } = await launchWithConductorStandIn());
+  });
+
+  afterEach(async () => {
+    await shutdown();
+  });
+
+  test('reads use the read model, commands use the system database', async () => {
+    const handle = await DBOS.startWorkflow(routedWorkflow, { workflowID: 'routed-real' })(1);
+    await handle.getResult();
+    const sysdb = DBOSExecutor.globalInstance!.systemDatabase;
+    const real = await sysdb.getWorkflowStatus('routed-real');
+    const calls: string[] = [];
+    const fake: ObservabilityReadModel = {
+      listWorkflows: (input) => {
+        calls.push(input.queuesOnly ? 'listQueued' : 'list');
+        return Promise.resolve([{ ...real!, workflowUUID: 'from-read-model' }]);
+      },
+      getWorkflowAggregates: () => {
+        calls.push('workflowAggregates');
+        return Promise.resolve([
+          { group: { status: 'SUCCESS' }, count: 42, minCreatedAt: null, maxQueueWaitMs: null, maxTotalLatencyMs: null },
+        ]);
+      },
+      getStepAggregates: () => {
+        calls.push('stepAggregates');
+        return Promise.resolve([{ group: { function_name: 'fake' }, count: 7, maxDurationMs: null }]);
+      },
+      getMetrics: () => {
+        calls.push('metrics');
+        return Promise.resolve([{ metricType: 'workflow_count', metricName: 'fake', value: 3 }]);
+      },
+    };
+    const saved = Object.getOwnPropertyDescriptor(sysdb, 'observability');
+    Object.defineProperty(sysdb, 'observability', { value: fake, configurable: true, writable: true });
+    try {
+      const send = (message: object) => conductorSocket.send(JSON.stringify(message));
+      send({ type: protocol.MessageType.LIST_WORKFLOWS, request_id: 'list', body: { workflow_uuids: [] } });
+      send({ type: protocol.MessageType.LIST_QUEUED_WORKFLOWS, request_id: 'queued', body: {} });
+      send({
+        type: protocol.MessageType.GET_WORKFLOW_AGGREGATES,
+        request_id: 'wf-agg',
+        body: { group_by_status: true, select_count: true },
+      });
+      send({
+        type: protocol.MessageType.GET_STEP_AGGREGATES,
+        request_id: 'step-agg',
+        body: { group_by_function_name: true, select_count: true },
+      });
+      send({
+        type: protocol.MessageType.GET_METRICS,
+        request_id: 'metrics',
+        start_time: new Date(0).toISOString(),
+        end_time: new Date().toISOString(),
+        metric_class: 'workflow_step_count',
+      });
+      send({ type: protocol.MessageType.GET_WORKFLOW, request_id: 'get', workflow_id: 'routed-real' });
+      await retryUntilSuccess(() => {
+        for (const id of ['list', 'queued', 'wf-agg', 'step-agg', 'metrics', 'get']) {
+          expect(answersTo(id)).toHaveLength(1);
+          expect(answersTo(id)[0].error_message).toBeUndefined();
+        }
+      });
+      const listed = answersTo('list')[0] as protocol.ListWorkflowsResponse;
+      expect(listed.output.map((w) => w.WorkflowUUID)).toEqual(['from-read-model']);
+      const queued = answersTo('queued')[0] as protocol.ListQueuedWorkflowsResponse;
+      expect(queued.output.map((w) => w.WorkflowUUID)).toEqual(['from-read-model']);
+      expect((answersTo('wf-agg')[0] as protocol.GetWorkflowAggregatesResponse).output).toEqual([
+        expect.objectContaining({ count: 42 }),
+      ]);
+      expect((answersTo('step-agg')[0] as protocol.GetStepAggregatesResponse).output).toEqual([
+        expect.objectContaining({ count: 7 }),
+      ]);
+      expect((answersTo('metrics')[0] as protocol.GetMetricsResponse).metrics).toEqual([
+        expect.objectContaining({ metric_name: 'fake', value: 3 }),
+      ]);
+      // GET_WORKFLOW is a point read by ID, served by the system database, not the read model.
+      expect((answersTo('get')[0] as protocol.GetWorkflowResponse).output?.WorkflowUUID).toBe('routed-real');
+      expect(calls.sort()).toEqual(['list', 'listQueued', 'metrics', 'stepAggregates', 'workflowAggregates']);
+    } finally {
+      if (saved) Object.defineProperty(sysdb, 'observability', saved);
+      else delete (sysdb as { observability?: ObservabilityReadModel }).observability;
+    }
   });
 });
 

@@ -54,10 +54,51 @@ export interface WorkflowStateAccess {
     timestamp: number;
     applicationName: string | null;
   }): Promise<void>;
+  /** A workflow row written by another application (null: unclaimed), with its input when given. */
+  insertPeerWorkflow(row: PeerWorkflow): Promise<void>;
+  /** A step checkpoint written by another application. */
+  insertPeerStep(row: {
+    workflowID: string;
+    functionID: number;
+    functionName: string;
+    output: string | null;
+    completedAt: number;
+    applicationName: string | null;
+  }): Promise<void>;
+  /** A schedule registered by another application, or by a release that predates ownership. */
+  insertPeerSchedule(row: {
+    scheduleID: string;
+    scheduleName: string;
+    workflowName: string;
+    schedule: string;
+    context: string;
+    applicationName: string | null;
+  }): Promise<void>;
+  /** A queue registered by another application, or by a release that predates ownership. */
+  insertPeerQueue(name: string, applicationName: string | null): Promise<void>;
+  readScheduleId(scheduleName: string): Promise<string | undefined>;
+  /** Stored payload rows the retention sweeps count: inputs, outputs, step checkpoints. */
+  payloadCounts(): Promise<[number, number, number]>;
+  /** Status rows whose payload a reader could still ask for but is gone: [no input, SUCCESS/ERROR with no output]. */
+  orphanedStatusRows(): Promise<[number, number]>;
+  /** Whether the workflow still has its status row and its input row. */
+  workflowRows(workflowID: string): Promise<{ status: boolean; input: boolean }>;
   /** Raw SQL for scenarios that only exist on PostgreSQL (rows written by pl/pgSQL or other languages). */
   sql(): Client;
   close(): Promise<void>;
 }
+
+export type PeerWorkflow = {
+  workflowID: string;
+  status: string;
+  name: string;
+  queueName: string | null;
+  createdAt: number;
+  completedAt: number | null;
+  applicationName: string | null;
+  /** Serialized input; null writes no input row. */
+  inputs: string | null;
+};
 
 export type StatusColumn =
   | 'status'
@@ -255,6 +296,91 @@ class PostgresWorkflowState implements WorkflowStateAccess {
        VALUES ($1, $2, $3, $4)`,
       [row.versionId, row.versionName, row.timestamp, row.applicationName],
     );
+  }
+
+  async insertPeerWorkflow(row: PeerWorkflow) {
+    await this.client.query(
+      `INSERT INTO dbos.workflow_status
+         (workflow_uuid, status, name, queue_name, executor_id, application_id, created_at, updated_at,
+          completed_at, recovery_attempts, priority, serialization, application_name)
+       VALUES ($1, $2, $3, $4, 'local', '', $5, $5, $6, 0, 0, 'portable_json', $7)`,
+      [row.workflowID, row.status, row.name, row.queueName, row.createdAt, row.completedAt, row.applicationName],
+    );
+    if (row.inputs !== null) {
+      await this.client.query(
+        `INSERT INTO dbos.workflow_input (workflow_uuid, inputs, retention_timestamp) VALUES ($1, $2, $3)`,
+        [row.workflowID, row.inputs, row.createdAt],
+      );
+    }
+  }
+
+  async insertPeerStep(row: {
+    workflowID: string;
+    functionID: number;
+    functionName: string;
+    output: string | null;
+    completedAt: number;
+    applicationName: string | null;
+  }) {
+    await this.client.query(
+      `INSERT INTO dbos.operation_outputs
+         (workflow_uuid, function_id, function_name, output, serialization, completed_at_epoch_ms, application_name)
+       VALUES ($1, $2, $3, $4, 'portable_json', $5, $6)`,
+      [row.workflowID, row.functionID, row.functionName, row.output, row.completedAt, row.applicationName],
+    );
+  }
+
+  async insertPeerSchedule(row: {
+    scheduleID: string;
+    scheduleName: string;
+    workflowName: string;
+    schedule: string;
+    context: string;
+    applicationName: string | null;
+  }) {
+    await this.client.query(
+      `INSERT INTO dbos.workflow_schedules (schedule_id, schedule_name, workflow_name, schedule, status, context, application_name)
+       VALUES ($1, $2, $3, $4, 'ACTIVE', $5, $6)`,
+      [row.scheduleID, row.scheduleName, row.workflowName, row.schedule, row.context, row.applicationName],
+    );
+  }
+
+  async insertPeerQueue(name: string, applicationName: string | null) {
+    await this.client.query(`INSERT INTO dbos.queues (name, application_name) VALUES ($1, $2)`, [name, applicationName]);
+  }
+
+  async readScheduleId(scheduleName: string) {
+    const { rows } = await this.client.query<{ schedule_id: string }>(
+      `SELECT schedule_id FROM dbos.workflow_schedules WHERE schedule_name = $1`,
+      [scheduleName],
+    );
+    return rows[0]?.schedule_id;
+  }
+
+  async payloadCounts(): Promise<[number, number, number]> {
+    const countOf = async (table: string) => {
+      const { rows } = await this.client.query<{ count: string }>(`SELECT COUNT(*) AS count FROM dbos.${table}`);
+      return Number(rows[0].count);
+    };
+    return [await countOf('workflow_input'), await countOf('workflow_output'), await countOf('operation_outputs')];
+  }
+
+  async orphanedStatusRows(): Promise<[number, number]> {
+    const { rows } = await this.client.query<{ no_input: string; no_output: string }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE wi.workflow_uuid IS NULL) AS no_input,
+         COUNT(*) FILTER (WHERE ws.status IN ('SUCCESS', 'ERROR') AND wo.workflow_uuid IS NULL) AS no_output
+       FROM dbos.workflow_status ws
+       LEFT JOIN dbos.workflow_input wi ON wi.workflow_uuid = ws.workflow_uuid
+       LEFT JOIN dbos.workflow_output wo ON wo.workflow_uuid = ws.workflow_uuid`,
+    );
+    return [Number(rows[0].no_input), Number(rows[0].no_output)];
+  }
+
+  async workflowRows(workflowID: string) {
+    const exists = async (table: string) =>
+      (await this.client.query(`SELECT 1 FROM dbos.${table} WHERE workflow_uuid = $1`, [workflowID])).rows.length > 0;
+    return { status: await exists('workflow_status'), input: await exists('workflow_input') };
   }
 
   sql() {

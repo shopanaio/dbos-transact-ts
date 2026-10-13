@@ -1,3 +1,4 @@
+import { toWorkflowStatus } from '../workflow_management';
 import { DBOSExecutor } from '../dbos-executor';
 import { getAlertHandler } from '../decorators';
 import { globalParams } from '../utils';
@@ -314,7 +315,9 @@ export class Conductor {
             };
             let workflowsOutput: protocol.WorkflowsOutput[] = [];
             try {
-              const workflows = await this.dbosExec.listWorkflows(listWFReq);
+              const database = this.dbosExec.systemDatabase;
+              const workflows = await Promise.all((await (database.observability ?? database).listWorkflows(listWFReq))
+                .map(wf => toWorkflowStatus(wf, database.serializer)));
               workflowsOutput = workflows.map((wf) => new protocol.WorkflowsOutput(wf));
             } catch (e) {
               errorMsg = this.reportException('Exception encountered when listing workflows', e);
@@ -355,7 +358,9 @@ export class Conductor {
             };
             let queuedWFOutput: protocol.WorkflowsOutput[] = [];
             try {
-              const workflows = await this.dbosExec.listQueuedWorkflows(listQueuedWFReq);
+              const database = this.dbosExec.systemDatabase;
+              const workflows = await Promise.all((await (database.observability ?? database).listWorkflows({ ...listQueuedWFReq, queuesOnly: true, loadOutput: false }))
+                .map(wf => toWorkflowStatus(wf, database.serializer)));
               queuedWFOutput = workflows.map((wf) => new protocol.WorkflowsOutput(wf));
             } catch (e) {
               errorMsg = this.reportException('Exception encountered when listing queued workflows', e);
@@ -471,7 +476,7 @@ export class Conductor {
             let metricsData: protocol.MetricDataOutput[] = [];
             if (getMetricsMessage.metric_class === 'workflow_step_count') {
               try {
-                const sysMetrics = await this.dbosExec.systemDatabase.getMetrics(
+                const sysMetrics = await (this.dbosExec.systemDatabase.observability ?? this.dbosExec.systemDatabase).getMetrics(
                   getMetricsMessage.start_time,
                   getMetricsMessage.end_time,
                   getMetricsMessage.application_name,
@@ -810,7 +815,7 @@ export class Conductor {
               selectCount = true;
             }
             try {
-              const rows = await this.dbosExec.systemDatabase.getWorkflowAggregates({
+              const rows = await (this.dbosExec.systemDatabase.observability ?? this.dbosExec.systemDatabase).getWorkflowAggregates({
                 groupByStatus: aggBody.group_by_status ?? false,
                 groupByName: aggBody.group_by_name ?? false,
                 groupByQueueName: aggBody.group_by_queue_name ?? false,
@@ -868,7 +873,7 @@ export class Conductor {
               stepSelectCount = true;
             }
             try {
-              const rows = await this.dbosExec.systemDatabase.getStepAggregates({
+              const rows = await (this.dbosExec.systemDatabase.observability ?? this.dbosExec.systemDatabase).getStepAggregates({
                 groupByFunctionName: stepAggBody.group_by_function_name ?? false,
                 groupByStatus: stepAggBody.group_by_status ?? false,
                 selectCount: stepSelectCount,

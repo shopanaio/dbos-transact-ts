@@ -969,7 +969,16 @@ export type QueueWakeupSource =
       probeBlocked?(queueName: string, hints: QueueHint[]): Promise<QueueHint[]>;
     };
 
+/** Путь наблюдаемости Conductor; команды всегда используют SystemDatabase. */
+export interface ObservabilityReadModel {
+  listWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatusInternal[]>;
+  getWorkflowAggregates(input: GetWorkflowAggregatesInput): Promise<WorkflowAggregateRow[]>;
+  getStepAggregates(input: GetStepAggregatesInput): Promise<StepAggregateRow[]>;
+  getMetrics(startTime: string, endTime: string, applicationName?: string[]): Promise<MetricData[]>;
+}
+
 export interface SystemDatabase extends Pick<SystemDatabaseLocalState, keyof SystemDatabaseLocalState> {
+  readonly observability?: ObservabilityReadModel;
   readonly queueWakeupSource?: QueueWakeupSource;
   registerInternalQueue?(record: QueueRecord): Promise<void>;
   readonly serializer: DBOSSerializer;
@@ -4305,532 +4314,16 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
 
   // ==================== Queries & Maintenance ====================
   async listWorkflows(input: GetWorkflowsInput): Promise<WorkflowStatusInternal[]> {
-    const schemaName = this.schemaName;
-    const selectColumns = [
-      'workflow_uuid',
-      'status',
-      'name',
-      'recovery_attempts',
-      'config_name',
-      'class_name',
-      'authenticated_user',
-      'authenticated_roles',
-      'assumed_role',
-      'queue_name',
-      'executor_id',
-      'created_at',
-      'updated_at',
-      'application_version',
-      'application_id',
-      'workflow_deadline_epoch_ms',
-      'workflow_timeout_ms',
-      'deduplication_id',
-      'priority',
-      'queue_partition_key',
-      'started_at_epoch_ms',
-      'forked_from',
-      'was_forked_from',
-      'parent_workflow_id',
-      'delay_until_epoch_ms',
-      'completed_at',
-      'attributes',
-      'schedule_name',
-      'debounce_deadline_epoch_ms',
-      'is_debounced',
-      'application_name',
-    ];
-
-    input.loadInput = input.loadInput ?? true;
-    input.loadOutput = input.loadOutput ?? true;
-    // Only join the payload table the caller actually asked for.
-    const payloadColumns: string[] = [];
-    const payloadJoins: string[] = [];
-    if (input.loadInput) {
-      payloadColumns.push('COALESCE(wi.inputs, workflow_status.inputs) AS inputs');
-      payloadJoins.push(
-        `LEFT JOIN "${schemaName}".workflow_input wi ON wi.workflow_uuid = workflow_status.workflow_uuid`,
-      );
-    }
-
-    if (input.loadOutput) {
-      payloadColumns.push('COALESCE(wo.output, workflow_status.output) AS output');
-      payloadColumns.push('COALESCE(wo.error, workflow_status.error) AS error');
-      payloadJoins.push(
-        `LEFT JOIN "${schemaName}".workflow_output wo ON wo.workflow_uuid = workflow_status.workflow_uuid`,
-      );
-    }
-
-    if (input.loadInput || input.loadOutput) {
-      selectColumns.push('serialization');
-    }
-
-    input.sortDesc = input.sortDesc ?? false; // By default, sort in ascending order
-
-    // Build WHERE clauses
-    const whereClauses: string[] = [];
-    const params: unknown[] = [];
-    let paramCounter = 1;
-
-    // Helper: add a filter for a field that may be a single value or an array.
-    // Uses = for a single value, IN (...) for an array.
-    const addFilter = (column: string, value: string | string[] | undefined) => {
-      if (!value) return;
-      if (Array.isArray(value)) {
-        const placeholders = value.map((_, i) => `$${paramCounter + i}`).join(', ');
-        whereClauses.push(`${column} IN (${placeholders})`);
-        params.push(...value);
-        paramCounter += value.length;
-      } else {
-        whereClauses.push(`${column} = $${paramCounter}`);
-        params.push(value);
-        paramCounter++;
-      }
-    };
-
-    // If queuesOnly, filter for queued workflows
-    if (input.queuesOnly) {
-      whereClauses.push(`queue_name IS NOT NULL`);
-      whereClauses.push(`status IN ($${paramCounter}, $${paramCounter + 1}, $${paramCounter + 2})`);
-      params.push(StatusString.ENQUEUED, StatusString.PENDING, StatusString.DELAYED);
-      paramCounter += 3;
-    }
-
-    addFilter('name', input.workflowName);
-    addFilter('queue_name', input.queueName);
-    addFilter('schedule_name', input.scheduleName);
-
-    // A workflow ID is a global address, so an ID-keyed read is an identity read: it takes an
-    // explicit filter but is never defaulted to this one. Otherwise unset scopes to this
-    // application, as on every other observability query.
-    // Falsy, not just undefined: a Conductor request carries an omitted list as JSON null.
-    const idKeyed = (input.workflowIDs?.length ?? 0) > 0;
-    whereClauses.push(
-      idKeyed
-        ? this.#appNameFilter('application_name', input.applicationName, params)
-        : this.#observabilityFilter('application_name', input.applicationName, params),
-    );
-    paramCounter = params.length + 1;
-
-    if (input.workflow_id_prefix) {
-      if (Array.isArray(input.workflow_id_prefix)) {
-        const likeClauses = input.workflow_id_prefix.map(
-          (_, i) => `workflow_status.workflow_uuid LIKE $${paramCounter + i}`,
-        );
-        whereClauses.push(`(${likeClauses.join(' OR ')})`);
-        params.push(...input.workflow_id_prefix.map((p) => `${p}%`));
-        paramCounter += input.workflow_id_prefix.length;
-      } else {
-        whereClauses.push(`workflow_status.workflow_uuid LIKE $${paramCounter}`);
-        params.push(`${input.workflow_id_prefix}%`);
-        paramCounter++;
-      }
-    }
-    if (input.workflowIDs) {
-      const placeholders = input.workflowIDs.map((_, i) => `$${paramCounter + i}`).join(', ');
-      whereClauses.push(`workflow_status.workflow_uuid IN (${placeholders})`);
-      params.push(...input.workflowIDs);
-      paramCounter += input.workflowIDs.length;
-    }
-
-    addFilter('authenticated_user', input.authenticatedUser);
-    addFilter('forked_from', input.forkedFrom);
-    addFilter('parent_workflow_id', input.parentWorkflowID);
-
-    if (input.wasForkedFrom !== undefined) {
-      whereClauses.push(`was_forked_from = $${paramCounter}`);
-      params.push(input.wasForkedFrom);
-      paramCounter++;
-    }
-
-    if (input.hasParent !== undefined) {
-      if (input.hasParent) {
-        whereClauses.push(`parent_workflow_id IS NOT NULL`);
-      } else {
-        whereClauses.push(`parent_workflow_id IS NULL`);
-      }
-    }
-
-    // Match workflows whose attributes JSONB contains all the given key-value pairs.
-    // The `@>` containment operator is served by the GIN index on the attributes column.
-    if (input.attributes && Object.keys(input.attributes).length > 0) {
-      whereClauses.push(`attributes @> $${paramCounter}::jsonb`);
-      params.push(JSON.stringify(input.attributes));
-      paramCounter++;
-    }
-
-    if (input.startTime) {
-      whereClauses.push(`created_at >= $${paramCounter}`);
-      params.push(new Date(input.startTime).getTime());
-      paramCounter++;
-    }
-    if (input.endTime) {
-      whereClauses.push(`created_at <= $${paramCounter}`);
-      params.push(new Date(input.endTime).getTime());
-      paramCounter++;
-    }
-    if (input.completedAfter) {
-      whereClauses.push(`completed_at >= $${paramCounter}`);
-      params.push(new Date(input.completedAfter).getTime());
-      paramCounter++;
-    }
-    if (input.completedBefore) {
-      whereClauses.push(`completed_at <= $${paramCounter}`);
-      params.push(new Date(input.completedBefore).getTime());
-      paramCounter++;
-    }
-    // dequeuedAfter/Before filter on started_at_epoch_ms: that column is
-    // populated on dequeue and surfaced as WorkflowStatus.dequeuedAt.
-    if (input.dequeuedAfter) {
-      whereClauses.push(`started_at_epoch_ms >= $${paramCounter}`);
-      params.push(new Date(input.dequeuedAfter).getTime());
-      paramCounter++;
-    }
-    if (input.dequeuedBefore) {
-      whereClauses.push(`started_at_epoch_ms <= $${paramCounter}`);
-      params.push(new Date(input.dequeuedBefore).getTime());
-      paramCounter++;
-    }
-
-    addFilter('status', input.status);
-    addFilter('application_version', input.applicationVersion);
-    addFilter('executor_id', input.executorId);
-
-    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-    const orderClause = `ORDER BY created_at ${input.sortDesc ? 'DESC' : 'ASC'}`;
-    let limitClause = '';
-    if (input.limit) {
-      limitClause = `LIMIT $${paramCounter}`;
-      params.push(input.limit);
-      paramCounter++;
-    }
-    let offsetClause = '';
-    if (input.offset) {
-      offsetClause = `OFFSET $${paramCounter}`;
-      params.push(input.offset);
-      paramCounter++;
-    }
-
-    const projection = [...selectColumns.map((c) => `workflow_status.${c}`), ...payloadColumns].join(', ');
-    const query = `
-      SELECT ${projection}
-      FROM "${schemaName}".workflow_status
-      ${payloadJoins.join('\n      ')}
-      ${whereClause}
-      ${orderClause}
-      ${limitClause}
-      ${offsetClause}
-    `;
-
-    // An ID-keyed read is bounded by its ID list, so it takes no cap: a status lookup must not fail its own caller.
-    const result = idKeyed
-      ? await this.pool.query<workflow_status>(query, params)
-      : await this.observabilityQuery((client) => client.query<workflow_status>(query, params));
-    return result.rows.map(mapWorkflowStatus);
+    if (input.workflowIDs?.length) return queryListWorkflows(this.pool, this.schemaName, { appName: this.appName }, input);
+    return this.observabilityQuery(client => queryListWorkflows(client, this.schemaName, { appName: this.appName }, input));
   }
 
   async getWorkflowAggregates(input: GetWorkflowAggregatesInput): Promise<WorkflowAggregateRow[]> {
-    if (input.timeBucketSizeMs !== undefined && input.timeBucketSizeMs <= 0) {
-      throw new Error('time_bucket_size_ms must be > 0');
-    }
-
-    const groupByFlags: [string, boolean, string][] = [
-      ['status', input.groupByStatus ?? false, 'status'],
-      ['name', input.groupByName ?? false, 'name'],
-      ['queue_name', input.groupByQueueName ?? false, 'queue_name'],
-      ['executor_id', input.groupByExecutorId ?? false, 'executor_id'],
-      ['application_version', input.groupByApplicationVersion ?? false, 'application_version'],
-      ['application_name', input.groupByApplicationName ?? false, 'application_name'],
-    ];
-
-    const groupNames: string[] = [];
-    const groupColumns: string[] = [];
-    const groupSelectColumns: string[] = [];
-    for (const [colName, enabled, col] of groupByFlags) {
-      if (enabled) {
-        groupNames.push(colName);
-        groupColumns.push(col);
-        groupSelectColumns.push(col);
-      }
-    }
-
-    const params: unknown[] = [];
-    if (input.timeBucketSizeMs !== undefined) {
-      // Bucket on created_at — the indexed wall-clock timestamp on workflow_status.
-      // One placeholder shared by SELECT and GROUP BY, so Postgres sees the two expressions as identical.
-      params.push(input.timeBucketSizeMs);
-      const bucket = `$${params.length}::bigint`;
-      const bucketExpr = `(CAST(FLOOR(created_at / ${bucket}) AS BIGINT) * ${bucket})`;
-      groupNames.push('time_bucket');
-      groupColumns.push(bucketExpr);
-      groupSelectColumns.push(`${bucketExpr} AS time_bucket`);
-    }
-
-    if (groupColumns.length === 0) {
-      throw new Error('At least one group_by flag must be set to True');
-    }
-
-    // Build select columns from boolean flags. MAX ignores NULLs, so rows
-    // missing started_at_epoch_ms or completed_at naturally drop out of the
-    // latency maxes.
-    const selectFlags: [string, boolean, string][] = [
-      ['count', input.selectCount ?? false, 'COUNT(*)'],
-      ['min_created_at', input.selectMinCreatedAt ?? false, 'MIN(created_at)'],
-      ['max_queue_wait_ms', input.selectMaxQueueWaitMs ?? false, 'MAX(started_at_epoch_ms - created_at)'],
-      ['max_total_latency_ms', input.selectMaxTotalLatencyMs ?? false, 'MAX(completed_at - created_at)'],
-    ];
-    const selectNames: string[] = [];
-    const selectColumns: string[] = [];
-    for (const [name, enabled, expr] of selectFlags) {
-      if (enabled) {
-        selectNames.push(name);
-        selectColumns.push(`${expr} AS ${name}`);
-      }
-    }
-
-    if (selectColumns.length === 0) {
-      throw new Error('At least one select_ flag must be set to True');
-    }
-
-    const whereClauses: string[] = [];
-    let paramIdx = params.length + 1;
-
-    const addFilter = (column: string, values: string[] | undefined) => {
-      if (!values || values.length === 0) return;
-      const placeholders = values.map((_, i) => `$${paramIdx + i}`).join(', ');
-      whereClauses.push(`${column} IN (${placeholders})`);
-      params.push(...values);
-      paramIdx += values.length;
-    };
-
-    addFilter('status', input.status);
-    addFilter('name', input.name);
-    addFilter('application_version', input.appVersion);
-    addFilter('executor_id', input.executorId);
-    addFilter('queue_name', input.queueName);
-
-    if (input.workflowIdPrefix && input.workflowIdPrefix.length > 0) {
-      const likeClauses = input.workflowIdPrefix.map((p) => {
-        params.push(`${p}%`);
-        return `workflow_uuid LIKE $${paramIdx++}`;
-      });
-      whereClauses.push(`(${likeClauses.join(' OR ')})`);
-    }
-
-    addFilter('workflow_uuid', input.workflowIDs);
-    addFilter('authenticated_user', input.authenticatedUser);
-    addFilter('forked_from', input.forkedFrom);
-    addFilter('parent_workflow_id', input.parentWorkflowID);
-    addFilter('schedule_name', input.scheduleName);
-
-    // Unset scopes to this application, as on every other observability query.
-    whereClauses.push(this.#observabilityFilter('application_name', input.applicationName, params));
-    paramIdx = params.length + 1;
-
-    if (input.wasForkedFrom !== undefined) {
-      whereClauses.push(`was_forked_from = $${paramIdx}`);
-      params.push(input.wasForkedFrom);
-      paramIdx++;
-    }
-
-    if (input.hasParent !== undefined) {
-      whereClauses.push(input.hasParent ? `parent_workflow_id IS NOT NULL` : `parent_workflow_id IS NULL`);
-    }
-
-    // Match workflows whose attributes JSONB contains all the given key-value pairs.
-    if (input.attributes && Object.keys(input.attributes).length > 0) {
-      whereClauses.push(`attributes @> $${paramIdx}::jsonb`);
-      params.push(JSON.stringify(input.attributes));
-      paramIdx++;
-    }
-
-    if (input.startTime) {
-      whereClauses.push(`created_at >= $${paramIdx}`);
-      params.push(new Date(input.startTime).getTime());
-      paramIdx++;
-    }
-    if (input.endTime) {
-      whereClauses.push(`created_at <= $${paramIdx}`);
-      params.push(new Date(input.endTime).getTime());
-      paramIdx++;
-    }
-    if (input.completedAfter) {
-      whereClauses.push(`completed_at >= $${paramIdx}`);
-      params.push(new Date(input.completedAfter).getTime());
-      paramIdx++;
-    }
-    if (input.completedBefore) {
-      whereClauses.push(`completed_at <= $${paramIdx}`);
-      params.push(new Date(input.completedBefore).getTime());
-      paramIdx++;
-    }
-    // dequeuedAfter/Before filter on started_at_epoch_ms: that column is
-    // populated on dequeue and surfaced as WorkflowStatus.dequeuedAt.
-    if (input.dequeuedAfter) {
-      whereClauses.push(`started_at_epoch_ms >= $${paramIdx}`);
-      params.push(new Date(input.dequeuedAfter).getTime());
-      paramIdx++;
-    }
-    if (input.dequeuedBefore) {
-      whereClauses.push(`started_at_epoch_ms <= $${paramIdx}`);
-      params.push(new Date(input.dequeuedBefore).getTime());
-      paramIdx++;
-    }
-
-    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-    const groupByClause = groupColumns.join(', ');
-    const selectClause = [...groupSelectColumns, ...selectColumns].join(', ');
-
-    const query = `
-      SELECT ${selectClause}
-      FROM "${this.schemaName}".workflow_status
-      ${whereClause}
-      GROUP BY ${groupByClause}
-    `;
-
-    const result = await this.observabilityQuery((client) => client.query<Record<string, unknown>>(query, params));
-
-    const toIntOrNull = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
-
-    return result.rows.map((row) => {
-      const group: Record<string, string | null> = {};
-      for (const name of groupNames) {
-        const v = row[name];
-        group[name] = v === null || v === undefined ? null : String(v as string | number | bigint);
-      }
-      return {
-        group,
-        count: selectNames.includes('count') ? toIntOrNull(row.count) : null,
-        minCreatedAt: selectNames.includes('min_created_at') ? toIntOrNull(row.min_created_at) : null,
-        maxQueueWaitMs: selectNames.includes('max_queue_wait_ms') ? toIntOrNull(row.max_queue_wait_ms) : null,
-        maxTotalLatencyMs: selectNames.includes('max_total_latency_ms') ? toIntOrNull(row.max_total_latency_ms) : null,
-      };
-    });
+    return this.observabilityQuery(client => queryGetWorkflowAggregates(client, this.schemaName, { appName: this.appName }, input));
   }
 
   async getStepAggregates(input: GetStepAggregatesInput): Promise<StepAggregateRow[]> {
-    if (input.timeBucketSizeMs !== undefined && input.timeBucketSizeMs <= 0) {
-      throw new Error('time_bucket_size_ms must be > 0');
-    }
-
-    // operation_outputs has no explicit status column; derive it from whether `error` is populated.
-    // Child-workflow mapping rows have NULL error, so they appear as SUCCESS — callers filter by function_name.
-    const statusExpr = `CASE WHEN error IS NULL THEN 'SUCCESS' ELSE 'ERROR' END`;
-
-    const groupByFlags: [string, boolean, string][] = [
-      ['function_name', input.groupByFunctionName ?? false, 'function_name'],
-      ['status', input.groupByStatus ?? false, statusExpr],
-    ];
-
-    const groupNames: string[] = [];
-    const groupColumns: string[] = [];
-    const groupSelectColumns: string[] = [];
-    for (const [colName, enabled, expr] of groupByFlags) {
-      if (enabled) {
-        groupNames.push(colName);
-        groupColumns.push(expr);
-        groupSelectColumns.push(`${expr} AS ${colName}`);
-      }
-    }
-
-    const params: unknown[] = [];
-    if (input.timeBucketSizeMs !== undefined) {
-      // Bucket on completed_at_epoch_ms — it's the indexed timestamp on
-      // this table.
-      params.push(input.timeBucketSizeMs);
-      const bucket = `$${params.length}::bigint`;
-      const bucketExpr = `(CAST(FLOOR(completed_at_epoch_ms / ${bucket}) AS BIGINT) * ${bucket})`;
-      groupNames.push('time_bucket');
-      groupColumns.push(bucketExpr);
-      groupSelectColumns.push(`${bucketExpr} AS time_bucket`);
-    }
-
-    if (groupColumns.length === 0) {
-      throw new Error('At least one group_by flag must be set to True');
-    }
-
-    // Build select columns from boolean flags. Child-workflow mapping rows record start and
-    // complete at nearly the same instant, so they contribute ~0; DBOS.getResult and DBOS.sleep
-    // rows span their whole wait, so those dominate the duration max.
-    const selectFlags: [string, boolean, string][] = [
-      ['count', input.selectCount ?? false, 'COUNT(*)'],
-      ['max_duration_ms', input.selectMaxDurationMs ?? false, 'MAX(completed_at_epoch_ms - started_at_epoch_ms)'],
-    ];
-    const selectNames: string[] = [];
-    const selectColumns: string[] = [];
-    for (const [name, enabled, expr] of selectFlags) {
-      if (enabled) {
-        selectNames.push(name);
-        selectColumns.push(`${expr} AS ${name}`);
-      }
-    }
-
-    if (selectColumns.length === 0) {
-      throw new Error('At least one select_ flag must be set to True');
-    }
-
-    const whereClauses: string[] = [];
-    let paramIdx = params.length + 1;
-
-    if (input.status && input.status.length > 0) {
-      const placeholders = input.status.map((_, i) => `$${paramIdx + i}`).join(', ');
-      whereClauses.push(`(${statusExpr}) IN (${placeholders})`);
-      params.push(...input.status);
-      paramIdx += input.status.length;
-    }
-    if (input.functionName && input.functionName.length > 0) {
-      const placeholders = input.functionName.map((_, i) => `$${paramIdx + i}`).join(', ');
-      whereClauses.push(`function_name IN (${placeholders})`);
-      params.push(...input.functionName);
-      paramIdx += input.functionName.length;
-    }
-    if (input.workflowIdPrefix && input.workflowIdPrefix.length > 0) {
-      const likeClauses = input.workflowIdPrefix.map((p) => {
-        params.push(`${p}%`);
-        return `workflow_uuid LIKE $${paramIdx++}`;
-      });
-      whereClauses.push(`(${likeClauses.join(' OR ')})`);
-    }
-    if (input.completedAfter) {
-      whereClauses.push(`completed_at_epoch_ms >= $${paramIdx}`);
-      params.push(new Date(input.completedAfter).getTime());
-      paramIdx++;
-    }
-    if (input.completedBefore) {
-      whereClauses.push(`completed_at_epoch_ms <= $${paramIdx}`);
-      params.push(new Date(input.completedBefore).getTime());
-      paramIdx++;
-    }
-    // Unset scopes to this application, as on every other observability query.
-    whereClauses.push(this.#observabilityFilter('application_name', input.applicationName, params));
-    paramIdx = params.length + 1;
-
-    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
-    const groupByClause = groupColumns.join(', ');
-    const selectClause = [...groupSelectColumns, ...selectColumns].join(', ');
-
-    const query = `
-      SELECT ${selectClause}
-      FROM "${this.schemaName}".operation_outputs
-      ${whereClause}
-      GROUP BY ${groupByClause}
-    `;
-
-    const result = await this.observabilityQuery((client) => client.query<Record<string, unknown>>(query, params));
-
-    const toIntOrNull = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
-
-    return result.rows.map((row) => {
-      const group: Record<string, string | null> = {};
-      for (const name of groupNames) {
-        const v = row[name];
-        group[name] = v === null || v === undefined ? null : String(v as string | number | bigint);
-      }
-      return {
-        group,
-        count: selectNames.includes('count') ? toIntOrNull(row.count) : null,
-        maxDurationMs: selectNames.includes('max_duration_ms') ? toIntOrNull(row.max_duration_ms) : null,
-      };
-    });
+    return this.observabilityQuery(client => queryGetStepAggregates(client, this.schemaName, { appName: this.appName }, input));
   }
 
   /** Whether the system database is CockroachDB. Resolved once, since detecting it costs a query. */
@@ -5207,47 +4700,7 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
 
   @dbRetry()
   async getMetrics(startTime: string, endTime: string, applicationName?: string[]): Promise<MetricData[]> {
-    const startEpochMs = new Date(startTime).getTime();
-    const endEpochMs = new Date(endTime).getTime();
-
-    const workflowParams: unknown[] = [startEpochMs, endEpochMs];
-    const workflowScope = this.#observabilityFilter('application_name', applicationName, workflowParams);
-    const stepParams: unknown[] = [startEpochMs, endEpochMs];
-    const stepScope = this.#observabilityFilter('application_name', applicationName, stepParams);
-
-    const [workflowResult, stepResult] = await this.observabilityQuery(async (client) => [
-      await client.query<{ name: string; count: string }>(
-        `SELECT name, COUNT(workflow_uuid) as count
-         FROM "${this.schemaName}".workflow_status
-         WHERE created_at >= $1 AND created_at < $2 AND ${workflowScope}
-         GROUP BY name`,
-        workflowParams,
-      ),
-      await client.query<{ function_name: string; count: string }>(
-        `SELECT function_name, COUNT(*) as count
-         FROM "${this.schemaName}".operation_outputs
-         WHERE completed_at_epoch_ms >= $1 AND completed_at_epoch_ms < $2 AND ${stepScope}
-         GROUP BY function_name`,
-        stepParams,
-      ),
-    ]);
-
-    const metrics: MetricData[] = [];
-    for (const row of workflowResult.rows) {
-      metrics.push({
-        metricType: 'workflow_count',
-        metricName: row.name,
-        value: Number(row.count),
-      });
-    }
-    for (const row of stepResult.rows) {
-      metrics.push({
-        metricType: 'step_count',
-        metricName: row.function_name,
-        value: Number(row.count),
-      });
-    }
-    return metrics;
+    return this.observabilityQuery(client => queryGetMetrics(client, this.schemaName, { appName: this.appName }, startTime, endTime, applicationName));
   }
 
   // ==================== Scheduling ====================
@@ -6524,4 +5977,616 @@ export class PostgresSystemDatabase extends SystemDatabaseLocalState implements 
 
     await connect();
   }
+}
+
+export async function queryListWorkflows(client: Pick<PoolClient, "query">, schemaName: string, options: { liveOnly?: boolean; appName?: string }, input: GetWorkflowsInput): Promise<WorkflowStatusInternal[]> {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schemaName)) throw new Error('Invalid schema name');
+  const appNameFilter = (column: string, value: string | string[] | null | undefined, params: unknown[]) => {
+    const names = !value ? [] : Array.isArray(value) ? value : [value];
+    if (!names.length) return 'TRUE';
+    params.push(names);
+    return `(${column} = ANY($${params.length}) OR ${column} IS NULL)`;
+  };
+  const observabilityFilter = (column: string, value: string | string[] | null | undefined, params: unknown[]) =>
+    appNameFilter(column, value ?? options.appName, params);
+
+
+    const selectColumns = [
+      'workflow_uuid',
+      'status',
+      'name',
+      'recovery_attempts',
+      'config_name',
+      'class_name',
+      'authenticated_user',
+      'authenticated_roles',
+      'assumed_role',
+      'queue_name',
+      'executor_id',
+      'created_at',
+      'updated_at',
+      'application_version',
+      'application_id',
+      'workflow_deadline_epoch_ms',
+      'workflow_timeout_ms',
+      'deduplication_id',
+      'priority',
+      'queue_partition_key',
+      'started_at_epoch_ms',
+      'forked_from',
+      'was_forked_from',
+      'parent_workflow_id',
+      'delay_until_epoch_ms',
+      'completed_at',
+      'attributes',
+      'schedule_name',
+      'debounce_deadline_epoch_ms',
+      'is_debounced',
+      'application_name',
+    ];
+
+    input = { ...input, loadInput: options.liveOnly ? false : (input.loadInput ?? true), loadOutput: options.liveOnly ? false : (input.loadOutput ?? true) };
+
+    // Only join the payload table the caller actually asked for.
+    const payloadColumns: string[] = [];
+    const payloadJoins: string[] = [];
+    if (input.loadInput) {
+      payloadColumns.push('COALESCE(wi.inputs, workflow_status.inputs) AS inputs');
+      payloadJoins.push(
+        `LEFT JOIN "${schemaName}".workflow_input wi ON wi.workflow_uuid = workflow_status.workflow_uuid`,
+      );
+    }
+
+    if (input.loadOutput) {
+      payloadColumns.push('COALESCE(wo.output, workflow_status.output) AS output');
+      payloadColumns.push('COALESCE(wo.error, workflow_status.error) AS error');
+      payloadJoins.push(
+        `LEFT JOIN "${schemaName}".workflow_output wo ON wo.workflow_uuid = workflow_status.workflow_uuid`,
+      );
+    }
+
+    if (options.liveOnly || input.loadInput || input.loadOutput) {
+      selectColumns.push('serialization');
+    }
+
+    input.sortDesc = input.sortDesc ?? false; // By default, sort in ascending order
+
+    // Build WHERE clauses
+    const whereClauses: string[] = options.liveOnly ? ["NOT rm_deleted"] : [];
+    const params: unknown[] = [];
+    let paramCounter = 1;
+
+    // Helper: add a filter for a field that may be a single value or an array.
+    // Uses = for a single value, IN (...) for an array.
+    const addFilter = (column: string, value: string | string[] | undefined) => {
+      if (!value) return;
+      if (Array.isArray(value)) {
+        const placeholders = value.map((_, i) => `$${paramCounter + i}`).join(', ');
+        whereClauses.push(`${column} IN (${placeholders})`);
+        params.push(...value);
+        paramCounter += value.length;
+      } else {
+        whereClauses.push(`${column} = $${paramCounter}`);
+        params.push(value);
+        paramCounter++;
+      }
+    };
+
+    // If queuesOnly, filter for queued workflows
+    if (input.queuesOnly) {
+      whereClauses.push(`queue_name IS NOT NULL`);
+      whereClauses.push(`status IN ($${paramCounter}, $${paramCounter + 1}, $${paramCounter + 2})`);
+      params.push(StatusString.ENQUEUED, StatusString.PENDING, StatusString.DELAYED);
+      paramCounter += 3;
+    }
+
+    addFilter('name', input.workflowName);
+    addFilter('queue_name', input.queueName);
+    addFilter('schedule_name', input.scheduleName);
+
+    // A workflow ID is a global address, so an ID-keyed read is an identity read: it takes an
+    // explicit filter but is never defaulted to this one. Otherwise unset scopes to this
+    // application, as on every other observability query.
+    // Falsy, not just undefined: a Conductor request carries an omitted list as JSON null.
+    const idKeyed = (input.workflowIDs?.length ?? 0) > 0;
+    whereClauses.push(
+      idKeyed
+        ? appNameFilter('application_name', input.applicationName, params)
+        : observabilityFilter('application_name', input.applicationName, params),
+    );
+    paramCounter = params.length + 1;
+
+    if (input.workflow_id_prefix) {
+      if (Array.isArray(input.workflow_id_prefix)) {
+        const likeClauses = input.workflow_id_prefix.map(
+          (_, i) => `workflow_status.workflow_uuid LIKE $${paramCounter + i}`,
+        );
+        whereClauses.push(`(${likeClauses.join(' OR ')})`);
+        params.push(...input.workflow_id_prefix.map((p) => `${p}%`));
+        paramCounter += input.workflow_id_prefix.length;
+      } else {
+        whereClauses.push(`workflow_status.workflow_uuid LIKE $${paramCounter}`);
+        params.push(`${input.workflow_id_prefix}%`);
+        paramCounter++;
+      }
+    }
+    if (input.workflowIDs) {
+      const placeholders = input.workflowIDs.map((_, i) => `$${paramCounter + i}`).join(', ');
+      // An empty ID list matches nothing, as every other backend reads it; `IN ()` is not SQL.
+      whereClauses.push(input.workflowIDs.length ? `workflow_status.workflow_uuid IN (${placeholders})` : 'FALSE');
+      params.push(...input.workflowIDs);
+      paramCounter += input.workflowIDs.length;
+    }
+
+    addFilter('authenticated_user', input.authenticatedUser);
+    addFilter('forked_from', input.forkedFrom);
+    addFilter('parent_workflow_id', input.parentWorkflowID);
+
+    if (input.wasForkedFrom !== undefined) {
+      whereClauses.push(`was_forked_from = $${paramCounter}`);
+      params.push(input.wasForkedFrom);
+      paramCounter++;
+    }
+
+    if (input.hasParent !== undefined) {
+      if (input.hasParent) {
+        whereClauses.push(`parent_workflow_id IS NOT NULL`);
+      } else {
+        whereClauses.push(`parent_workflow_id IS NULL`);
+      }
+    }
+
+    // Match workflows whose attributes JSONB contains all the given key-value pairs.
+    // The `@>` containment operator is served by the GIN index on the attributes column.
+    if (input.attributes && Object.keys(input.attributes).length > 0) {
+      whereClauses.push(`attributes @> $${paramCounter}::jsonb`);
+      params.push(JSON.stringify(input.attributes));
+      paramCounter++;
+    }
+
+    if (input.startTime) {
+      whereClauses.push(`created_at >= $${paramCounter}`);
+      params.push(new Date(input.startTime).getTime());
+      paramCounter++;
+    }
+    if (input.endTime) {
+      whereClauses.push(`created_at <= $${paramCounter}`);
+      params.push(new Date(input.endTime).getTime());
+      paramCounter++;
+    }
+    if (input.completedAfter) {
+      whereClauses.push(`completed_at >= $${paramCounter}`);
+      params.push(new Date(input.completedAfter).getTime());
+      paramCounter++;
+    }
+    if (input.completedBefore) {
+      whereClauses.push(`completed_at <= $${paramCounter}`);
+      params.push(new Date(input.completedBefore).getTime());
+      paramCounter++;
+    }
+    // dequeuedAfter/Before filter on started_at_epoch_ms: that column is
+    // populated on dequeue and surfaced as WorkflowStatus.dequeuedAt.
+    if (input.dequeuedAfter) {
+      whereClauses.push(`started_at_epoch_ms >= $${paramCounter}`);
+      params.push(new Date(input.dequeuedAfter).getTime());
+      paramCounter++;
+    }
+    if (input.dequeuedBefore) {
+      whereClauses.push(`started_at_epoch_ms <= $${paramCounter}`);
+      params.push(new Date(input.dequeuedBefore).getTime());
+      paramCounter++;
+    }
+
+    addFilter('status', input.status);
+    addFilter('application_version', input.applicationVersion);
+    addFilter('executor_id', input.executorId);
+
+    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+    const orderClause = `ORDER BY created_at ${input.sortDesc ? 'DESC' : 'ASC'}`;
+    let limitClause = '';
+    if (input.limit) {
+      limitClause = `LIMIT $${paramCounter}`;
+      params.push(input.limit);
+      paramCounter++;
+    }
+    let offsetClause = '';
+    if (input.offset) {
+      offsetClause = `OFFSET $${paramCounter}`;
+      params.push(input.offset);
+      paramCounter++;
+    }
+
+    const projection = [...selectColumns.map((c) => `workflow_status.${c}`), ...payloadColumns].join(', ');
+    const query = `
+      SELECT ${projection}
+      FROM "${schemaName}".workflow_status
+      ${payloadJoins.join('\n      ')}
+      ${whereClause}
+      ${orderClause}
+      ${limitClause}
+      ${offsetClause}
+    `;
+
+    // An ID-keyed read is bounded by its ID list, so it takes no cap: a status lookup must not fail its own caller.
+    const result = await client.query<workflow_status>(query, params);
+    return result.rows.map(mapWorkflowStatus);
+}
+
+export async function queryGetWorkflowAggregates(client: Pick<PoolClient, "query">, schemaName: string, options: { liveOnly?: boolean; appName?: string }, input: GetWorkflowAggregatesInput): Promise<WorkflowAggregateRow[]> {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schemaName)) throw new Error('Invalid schema name');
+  const appNameFilter = (column: string, value: string | string[] | null | undefined, params: unknown[]) => {
+    const names = !value ? [] : Array.isArray(value) ? value : [value];
+    if (!names.length) return 'TRUE';
+    params.push(names);
+    return `(${column} = ANY($${params.length}) OR ${column} IS NULL)`;
+  };
+  const observabilityFilter = (column: string, value: string | string[] | null | undefined, params: unknown[]) =>
+    appNameFilter(column, value ?? options.appName, params);
+
+    if (input.timeBucketSizeMs !== undefined && input.timeBucketSizeMs <= 0) {
+      throw new Error('time_bucket_size_ms must be > 0');
+    }
+
+    const groupByFlags: [string, boolean, string][] = [
+      ['status', input.groupByStatus ?? false, 'status'],
+      ['name', input.groupByName ?? false, 'name'],
+      ['queue_name', input.groupByQueueName ?? false, 'queue_name'],
+      ['executor_id', input.groupByExecutorId ?? false, 'executor_id'],
+      ['application_version', input.groupByApplicationVersion ?? false, 'application_version'],
+      ['application_name', input.groupByApplicationName ?? false, 'application_name'],
+    ];
+
+    const groupNames: string[] = [];
+    const groupColumns: string[] = [];
+    const groupSelectColumns: string[] = [];
+    for (const [colName, enabled, col] of groupByFlags) {
+      if (enabled) {
+        groupNames.push(colName);
+        groupColumns.push(col);
+        groupSelectColumns.push(col);
+      }
+    }
+
+    const params: unknown[] = [];
+    if (input.timeBucketSizeMs !== undefined) {
+      // Bucket on created_at — the indexed wall-clock timestamp on workflow_status.
+      // One placeholder shared by SELECT and GROUP BY, so Postgres sees the two expressions as identical.
+      params.push(input.timeBucketSizeMs);
+      const bucket = `$${params.length}::bigint`;
+      const bucketExpr = `(CAST(FLOOR(created_at / ${bucket}) AS BIGINT) * ${bucket})`;
+      groupNames.push('time_bucket');
+      groupColumns.push(bucketExpr);
+      groupSelectColumns.push(`${bucketExpr} AS time_bucket`);
+    }
+
+    if (groupColumns.length === 0) {
+      throw new Error('At least one group_by flag must be set to True');
+    }
+
+    // Build select columns from boolean flags. MAX ignores NULLs, so rows
+    // missing started_at_epoch_ms or completed_at naturally drop out of the
+    // latency maxes.
+    const selectFlags: [string, boolean, string][] = [
+      ['count', input.selectCount ?? false, 'COUNT(*)'],
+      ['min_created_at', input.selectMinCreatedAt ?? false, 'MIN(created_at)'],
+      ['max_queue_wait_ms', input.selectMaxQueueWaitMs ?? false, 'MAX(started_at_epoch_ms - created_at)'],
+      ['max_total_latency_ms', input.selectMaxTotalLatencyMs ?? false, 'MAX(completed_at - created_at)'],
+    ];
+    const selectNames: string[] = [];
+    const selectColumns: string[] = [];
+    for (const [name, enabled, expr] of selectFlags) {
+      if (enabled) {
+        selectNames.push(name);
+        selectColumns.push(`${expr} AS ${name}`);
+      }
+    }
+
+    if (selectColumns.length === 0) {
+      throw new Error('At least one select_ flag must be set to True');
+    }
+
+    const whereClauses: string[] = options.liveOnly ? ["NOT rm_deleted"] : [];
+    let paramIdx = params.length + 1;
+
+    const addFilter = (column: string, values: string[] | undefined) => {
+      if (!values || values.length === 0) return;
+      const placeholders = values.map((_, i) => `$${paramIdx + i}`).join(', ');
+      whereClauses.push(`${column} IN (${placeholders})`);
+      params.push(...values);
+      paramIdx += values.length;
+    };
+
+    addFilter('status', input.status);
+    addFilter('name', input.name);
+    addFilter('application_version', input.appVersion);
+    addFilter('executor_id', input.executorId);
+    addFilter('queue_name', input.queueName);
+
+    if (input.workflowIdPrefix && input.workflowIdPrefix.length > 0) {
+      const likeClauses = input.workflowIdPrefix.map((p) => {
+        params.push(`${p}%`);
+        return `workflow_uuid LIKE $${paramIdx++}`;
+      });
+      whereClauses.push(`(${likeClauses.join(' OR ')})`);
+    }
+
+    addFilter('workflow_uuid', input.workflowIDs);
+    addFilter('authenticated_user', input.authenticatedUser);
+    addFilter('forked_from', input.forkedFrom);
+    addFilter('parent_workflow_id', input.parentWorkflowID);
+    addFilter('schedule_name', input.scheduleName);
+
+    // Unset scopes to this application, as on every other observability query.
+    whereClauses.push(observabilityFilter('application_name', input.applicationName, params));
+    paramIdx = params.length + 1;
+
+    if (input.wasForkedFrom !== undefined) {
+      whereClauses.push(`was_forked_from = $${paramIdx}`);
+      params.push(input.wasForkedFrom);
+      paramIdx++;
+    }
+
+    if (input.hasParent !== undefined) {
+      whereClauses.push(input.hasParent ? `parent_workflow_id IS NOT NULL` : `parent_workflow_id IS NULL`);
+    }
+
+    // Match workflows whose attributes JSONB contains all the given key-value pairs.
+    if (input.attributes && Object.keys(input.attributes).length > 0) {
+      whereClauses.push(`attributes @> $${paramIdx}::jsonb`);
+      params.push(JSON.stringify(input.attributes));
+      paramIdx++;
+    }
+
+    if (input.startTime) {
+      whereClauses.push(`created_at >= $${paramIdx}`);
+      params.push(new Date(input.startTime).getTime());
+      paramIdx++;
+    }
+    if (input.endTime) {
+      whereClauses.push(`created_at <= $${paramIdx}`);
+      params.push(new Date(input.endTime).getTime());
+      paramIdx++;
+    }
+    if (input.completedAfter) {
+      whereClauses.push(`completed_at >= $${paramIdx}`);
+      params.push(new Date(input.completedAfter).getTime());
+      paramIdx++;
+    }
+    if (input.completedBefore) {
+      whereClauses.push(`completed_at <= $${paramIdx}`);
+      params.push(new Date(input.completedBefore).getTime());
+      paramIdx++;
+    }
+    // dequeuedAfter/Before filter on started_at_epoch_ms: that column is
+    // populated on dequeue and surfaced as WorkflowStatus.dequeuedAt.
+    if (input.dequeuedAfter) {
+      whereClauses.push(`started_at_epoch_ms >= $${paramIdx}`);
+      params.push(new Date(input.dequeuedAfter).getTime());
+      paramIdx++;
+    }
+    if (input.dequeuedBefore) {
+      whereClauses.push(`started_at_epoch_ms <= $${paramIdx}`);
+      params.push(new Date(input.dequeuedBefore).getTime());
+      paramIdx++;
+    }
+
+    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+    const groupByClause = groupColumns.join(', ');
+    const selectClause = [...groupSelectColumns, ...selectColumns].join(', ');
+
+    const query = `
+      SELECT ${selectClause}
+      FROM "${schemaName}".workflow_status
+      ${whereClause}
+      GROUP BY ${groupByClause}
+    `;
+
+    const result = await client.query<Record<string, unknown>>(query, params);
+
+    const toIntOrNull = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
+
+    return result.rows.map((row) => {
+      const group: Record<string, string | null> = {};
+      for (const name of groupNames) {
+        const v = row[name];
+        group[name] = v === null || v === undefined ? null : String(v as string | number | bigint);
+      }
+      return {
+        group,
+        count: selectNames.includes('count') ? toIntOrNull(row.count) : null,
+        minCreatedAt: selectNames.includes('min_created_at') ? toIntOrNull(row.min_created_at) : null,
+        maxQueueWaitMs: selectNames.includes('max_queue_wait_ms') ? toIntOrNull(row.max_queue_wait_ms) : null,
+        maxTotalLatencyMs: selectNames.includes('max_total_latency_ms') ? toIntOrNull(row.max_total_latency_ms) : null,
+      };
+    });
+}
+
+export async function queryGetStepAggregates(client: Pick<PoolClient, "query">, schemaName: string, options: { liveOnly?: boolean; appName?: string }, input: GetStepAggregatesInput): Promise<StepAggregateRow[]> {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schemaName)) throw new Error('Invalid schema name');
+  const appNameFilter = (column: string, value: string | string[] | null | undefined, params: unknown[]) => {
+    const names = !value ? [] : Array.isArray(value) ? value : [value];
+    if (!names.length) return 'TRUE';
+    params.push(names);
+    return `(${column} = ANY($${params.length}) OR ${column} IS NULL)`;
+  };
+  const observabilityFilter = (column: string, value: string | string[] | null | undefined, params: unknown[]) =>
+    appNameFilter(column, value ?? options.appName, params);
+
+    if (input.timeBucketSizeMs !== undefined && input.timeBucketSizeMs <= 0) {
+      throw new Error('time_bucket_size_ms must be > 0');
+    }
+
+    // operation_outputs has no explicit status column; derive it from whether `error` is populated.
+    // Child-workflow mapping rows have NULL error, so they appear as SUCCESS — callers filter by function_name.
+    const statusExpr = `CASE WHEN error IS NULL THEN 'SUCCESS' ELSE 'ERROR' END`;
+
+    const groupByFlags: [string, boolean, string][] = [
+      ['function_name', input.groupByFunctionName ?? false, 'function_name'],
+      ['status', input.groupByStatus ?? false, statusExpr],
+    ];
+
+    const groupNames: string[] = [];
+    const groupColumns: string[] = [];
+    const groupSelectColumns: string[] = [];
+    for (const [colName, enabled, expr] of groupByFlags) {
+      if (enabled) {
+        groupNames.push(colName);
+        groupColumns.push(expr);
+        groupSelectColumns.push(`${expr} AS ${colName}`);
+      }
+    }
+
+    const params: unknown[] = [];
+    if (input.timeBucketSizeMs !== undefined) {
+      // Bucket on completed_at_epoch_ms — it's the indexed timestamp on
+      // this table.
+      params.push(input.timeBucketSizeMs);
+      const bucket = `$${params.length}::bigint`;
+      const bucketExpr = `(CAST(FLOOR(completed_at_epoch_ms / ${bucket}) AS BIGINT) * ${bucket})`;
+      groupNames.push('time_bucket');
+      groupColumns.push(bucketExpr);
+      groupSelectColumns.push(`${bucketExpr} AS time_bucket`);
+    }
+
+    if (groupColumns.length === 0) {
+      throw new Error('At least one group_by flag must be set to True');
+    }
+
+    // Build select columns from boolean flags. Child-workflow mapping rows record start and
+    // complete at nearly the same instant, so they contribute ~0; DBOS.getResult and DBOS.sleep
+    // rows span their whole wait, so those dominate the duration max.
+    const selectFlags: [string, boolean, string][] = [
+      ['count', input.selectCount ?? false, 'COUNT(*)'],
+      ['max_duration_ms', input.selectMaxDurationMs ?? false, 'MAX(completed_at_epoch_ms - started_at_epoch_ms)'],
+    ];
+    const selectNames: string[] = [];
+    const selectColumns: string[] = [];
+    for (const [name, enabled, expr] of selectFlags) {
+      if (enabled) {
+        selectNames.push(name);
+        selectColumns.push(`${expr} AS ${name}`);
+      }
+    }
+
+    if (selectColumns.length === 0) {
+      throw new Error('At least one select_ flag must be set to True');
+    }
+
+    const whereClauses: string[] = options.liveOnly ? ["NOT rm_deleted"] : [];
+    let paramIdx = params.length + 1;
+
+    if (input.status && input.status.length > 0) {
+      const placeholders = input.status.map((_, i) => `$${paramIdx + i}`).join(', ');
+      whereClauses.push(`(${statusExpr}) IN (${placeholders})`);
+      params.push(...input.status);
+      paramIdx += input.status.length;
+    }
+    if (input.functionName && input.functionName.length > 0) {
+      const placeholders = input.functionName.map((_, i) => `$${paramIdx + i}`).join(', ');
+      whereClauses.push(`function_name IN (${placeholders})`);
+      params.push(...input.functionName);
+      paramIdx += input.functionName.length;
+    }
+    if (input.workflowIdPrefix && input.workflowIdPrefix.length > 0) {
+      const likeClauses = input.workflowIdPrefix.map((p) => {
+        params.push(`${p}%`);
+        return `workflow_uuid LIKE $${paramIdx++}`;
+      });
+      whereClauses.push(`(${likeClauses.join(' OR ')})`);
+    }
+    if (input.completedAfter) {
+      whereClauses.push(`completed_at_epoch_ms >= $${paramIdx}`);
+      params.push(new Date(input.completedAfter).getTime());
+      paramIdx++;
+    }
+    if (input.completedBefore) {
+      whereClauses.push(`completed_at_epoch_ms <= $${paramIdx}`);
+      params.push(new Date(input.completedBefore).getTime());
+      paramIdx++;
+    }
+    // Unset scopes to this application, as on every other observability query.
+    whereClauses.push(observabilityFilter('application_name', input.applicationName, params));
+    paramIdx = params.length + 1;
+
+    const whereClause = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+    const groupByClause = groupColumns.join(', ');
+    const selectClause = [...groupSelectColumns, ...selectColumns].join(', ');
+
+    const query = `
+      SELECT ${selectClause}
+      FROM "${schemaName}".operation_outputs
+      ${whereClause}
+      GROUP BY ${groupByClause}
+    `;
+
+    const result = await client.query<Record<string, unknown>>(query, params);
+
+    const toIntOrNull = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
+
+    return result.rows.map((row) => {
+      const group: Record<string, string | null> = {};
+      for (const name of groupNames) {
+        const v = row[name];
+        group[name] = v === null || v === undefined ? null : String(v as string | number | bigint);
+      }
+      return {
+        group,
+        count: selectNames.includes('count') ? toIntOrNull(row.count) : null,
+        maxDurationMs: selectNames.includes('max_duration_ms') ? toIntOrNull(row.max_duration_ms) : null,
+      };
+    });
+}
+
+export async function queryGetMetrics(client: Pick<PoolClient, "query">, schemaName: string, options: { liveOnly?: boolean; appName?: string }, startTime: string, endTime: string, applicationName?: string[]): Promise<MetricData[]> {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schemaName)) throw new Error('Invalid schema name');
+  const appNameFilter = (column: string, value: string | string[] | null | undefined, params: unknown[]) => {
+    const names = !value ? [] : Array.isArray(value) ? value : [value];
+    if (!names.length) return 'TRUE';
+    params.push(names);
+    return `(${column} = ANY($${params.length}) OR ${column} IS NULL)`;
+  };
+  const observabilityFilter = (column: string, value: string | string[] | null | undefined, params: unknown[]) =>
+    appNameFilter(column, value ?? options.appName, params);
+
+    const startEpochMs = new Date(startTime).getTime();
+    const endEpochMs = new Date(endTime).getTime();
+
+    const workflowParams: unknown[] = [startEpochMs, endEpochMs];
+    const workflowScope = observabilityFilter('application_name', applicationName, workflowParams);
+    const stepParams: unknown[] = [startEpochMs, endEpochMs];
+    const stepScope = observabilityFilter('application_name', applicationName, stepParams);
+
+    const [workflowResult, stepResult] = await (async () => [
+      await client.query<{ name: string; count: string }>(
+        `SELECT name, COUNT(workflow_uuid) as count
+         FROM "${schemaName}".workflow_status
+         WHERE created_at >= $1 AND created_at < $2 AND ${workflowScope} ${options.liveOnly ? "AND NOT rm_deleted" : ""}
+         GROUP BY name`,
+        workflowParams,
+      ),
+      await client.query<{ function_name: string; count: string }>(
+        `SELECT function_name, COUNT(*) as count
+         FROM "${schemaName}".operation_outputs
+         WHERE completed_at_epoch_ms >= $1 AND completed_at_epoch_ms < $2 AND ${stepScope} ${options.liveOnly ? "AND NOT rm_deleted" : ""}
+         GROUP BY function_name`,
+        stepParams,
+      ),
+    ] as const)();
+
+    const metrics: MetricData[] = [];
+    for (const row of workflowResult.rows) {
+      metrics.push({
+        metricType: 'workflow_count',
+        metricName: row.name,
+        value: Number(row.count),
+      });
+    }
+    for (const row of stepResult.rows) {
+      metrics.push({
+        metricType: 'step_count',
+        metricName: row.function_name,
+        value: Number(row.count),
+      });
+    }
+    return metrics;
 }

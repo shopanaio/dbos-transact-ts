@@ -1,4 +1,5 @@
 import { withTestClientDatabase } from './system-database-factory';
+import { openWorkflowState, type WorkflowStateAccess } from './system-database-state';
 import { GetWorkflowsInput, StatusString, DBOS, DBOSClient } from '../src';
 import { DBOSConfig, DBOSExecutor } from '../src/dbos-executor';
 import {
@@ -30,6 +31,7 @@ import { DBOSJSON } from '../src/serialization';
 describe('workflow-management-tests', () => {
   let config: DBOSConfig;
   let systemDBClient: Client;
+  let state: WorkflowStateAccess;
 
   beforeAll(() => {
     config = generateDBOSTestConfig();
@@ -45,9 +47,11 @@ describe('workflow-management-tests', () => {
       connectionString: config.systemDatabaseUrl,
     });
     await systemDBClient.connect();
+    state = await openWorkflowState(config);
   });
 
   afterEach(async () => {
+    await state.close();
     await systemDBClient.end();
     await DBOS.shutdown();
     process.env.DBOS__APPVERSION = undefined;
@@ -323,26 +327,16 @@ describe('workflow-management-tests', () => {
     await DBOS.send(workflowID, 'message');
     await expect(handle.getResult()).resolves.toEqual(`42-message`);
 
-    let result = await systemDBClient.query<{ status: string; attempts: number }>(
-      `SELECT status, recovery_attempts as attempts FROM dbos.workflow_status WHERE workflow_uuid=$1`,
-      [workflowID],
-    );
-    let rows = result.rows;
-    expect(rows[0].attempts).toBe(String(1));
-    expect(rows[0].status).toBe(StatusString.SUCCESS);
+    expect(await state.readRecoveryAttempts(workflowID)).toBe(1);
+    expect((await state.readStatusColumns(workflowID, ['status']))?.status).toBe(StatusString.SUCCESS);
     await expect(handle.getStatus()).resolves.toMatchObject({
       status: StatusString.SUCCESS,
     });
 
     await DBOS.cancelWorkflow(workflowID);
 
-    result = await systemDBClient.query<{ status: string; attempts: number }>(
-      `SELECT status, recovery_attempts as attempts FROM dbos.workflow_status WHERE workflow_uuid=$1`,
-      [workflowID],
-    );
-    rows = result.rows;
-    expect(rows[0].attempts).toBe(String(1));
-    expect(rows[0].status).toBe(StatusString.SUCCESS);
+    expect(await state.readRecoveryAttempts(workflowID)).toBe(1);
+    expect((await state.readStatusColumns(workflowID, ['status']))?.status).toBe(StatusString.SUCCESS);
   });
 
   test('[postgres-only] test-cancel-retry-restart', async () => {
@@ -574,7 +568,7 @@ describe('workflow-management-tests', () => {
     expect(cancelledHandle.workflowID).toBe(cancelID);
   });
 
-  test('systemdb-migration-backward-compatible', async () => {
+  test('[postgres-only] systemdb-migration-backward-compatible', async () => {
     // Make sure the system DB migration failure is handled correctly.
     // If there is a migration failure, the system DB should still be able to start.
     // This happens when the old code is running with a new system DB schema.
@@ -669,6 +663,7 @@ describe('test-list-queues', () => {
   let config: DBOSConfig;
   // The retention tests below read the payload tables directly.
   let systemDBClient: Client;
+  let state: WorkflowStateAccess;
 
   beforeAll(async () => {
     config = generateDBOSTestConfig();
@@ -682,9 +677,11 @@ describe('test-list-queues', () => {
     await DBOS.registerQueue(TestGarbageCollection.queue.name, { onConflict: 'always_update' });
     systemDBClient = new Client({ connectionString: config.systemDatabaseUrl });
     await systemDBClient.connect();
+    state = await openWorkflowState(config);
   });
 
   afterEach(async () => {
+    await state.close();
     await systemDBClient.end();
     await DBOS.shutdown();
   });
@@ -963,7 +960,9 @@ describe('test-list-queues', () => {
     workflows = await DBOS.listWorkflows({});
     expect(workflows.length).toBe(numWorkflows);
 
-    // ENQUEUED and DELAYED workflows must not be garbage collected
+    // ENQUEUED and DELAYED workflows must not be garbage collected. The queue is paused so the
+    // enqueued one stays ENQUEUED whatever the dispatch latency (polling or hint-driven).
+    await DBOS.pauseQueue(TestGarbageCollection.queue.name);
     const enqueuedHandle = await DBOS.startWorkflow(TestGarbageCollection, {
       queueName: TestGarbageCollection.queue.name,
     }).gcQueuedWorkflow();
@@ -984,6 +983,7 @@ describe('test-list-queues', () => {
     // Clean up so they don't interfere with the rest of the test
     await DBOS.cancelWorkflow(enqueuedHandle.workflowID);
     await DBOS.cancelWorkflow(delayedHandle.workflowID);
+    await DBOS.wakeQueue(TestGarbageCollection.queue.name);
 
     // Conductor sends a disabled threshold as JSON null, not undefined
     await (DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase).garbageCollect(
@@ -1071,7 +1071,7 @@ describe('test-list-queues', () => {
   const isBatchProbe = (sql: string) => /SELECT\s+completed_at/i.test(sql) && /LIMIT 1 OFFSET \d+/.test(sql);
 
   // 3 = short final batch, 5 = exact multiple, 20 = larger than all eligible rows
-  test.each([3, 5, 20])('test-garbage-collection-batched (batchSize=%i)', async (batchSize) => {
+  test.each([3, 5, 20])('[postgres-only] test-garbage-collection-batched (batchSize=%i)', async (batchSize) => {
     const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
     // Earlier tests in this describe share the database, so start from an empty table.
     await sysdb.garbageCollect(cutoffPastAllCompletions(), undefined, { batchSize: null });
@@ -1330,43 +1330,6 @@ describe('test-list-queues', () => {
     return !/cockroachdb/i.test(rows[0].version);
   }
 
-  /** Row counts of the three tables the payload sweep collects: inputs, outputs, steps. */
-  async function payloadCounts(client: Client): Promise<[number, number, number]> {
-    const countOf = async (table: string) => {
-      const { rows } = await client.query<{ count: string }>(`SELECT COUNT(*) AS count FROM dbos.${table}`);
-      return Number(rows[0].count);
-    };
-    return [await countOf('workflow_input'), await countOf('workflow_output'), await countOf('operation_outputs')];
-  }
-
-  /** Status rows a reader could still ask a payload for, but whose payload is already gone. */
-  async function orphanedStatusRows(client: Client): Promise<[number, number]> {
-    const { rows } = await client.query<{ no_input: string; no_output: string }>(
-      `SELECT
-         COUNT(*) FILTER (WHERE wi.workflow_uuid IS NULL) AS no_input,
-         COUNT(*) FILTER (WHERE ws.status IN ('SUCCESS', 'ERROR') AND wo.workflow_uuid IS NULL) AS no_output
-       FROM dbos.workflow_status ws
-       LEFT JOIN dbos.workflow_input wi ON wi.workflow_uuid = ws.workflow_uuid
-       LEFT JOIN dbos.workflow_output wo ON wo.workflow_uuid = ws.workflow_uuid`,
-    );
-    return [Number(rows[0].no_input), Number(rows[0].no_output)];
-  }
-
-  /** A terminal workflow belonging to another application, with its input alongside. */
-  async function insertPeerWorkflow(client: Client, id: string, createdAt: number): Promise<void> {
-    await client.query(
-      `INSERT INTO dbos.workflow_status
-         (workflow_uuid, status, name, executor_id, application_id, created_at, updated_at, completed_at,
-          recovery_attempts, priority, serialization, application_name)
-       VALUES ($1, 'SUCCESS', 'peerWorkflow', 'local', '', $2, $2, $2, 0, 0, 'portable_json', 'a-different-application')`,
-      [id, createdAt],
-    );
-    await client.query(
-      `INSERT INTO dbos.workflow_input (workflow_uuid, inputs, retention_timestamp) VALUES ($1, '{}', $2)`,
-      [id, createdAt],
-    );
-  }
-
   test('[postgres-only] test-destroy-cuts-a-running-retention-round', async () => {
     // A round holds the advisory lock for its whole duration and a connection for each
     // statement in flight. Closing the pool would wait on both, so destroy() cuts them first.
@@ -1452,11 +1415,11 @@ describe('test-list-queues', () => {
       await sleepms(5);
     }
     const full: [number, number, number] = [numWorkflows, numWorkflows, numWorkflows];
-    await expect(payloadCounts(systemDBClient)).resolves.toEqual(full);
+    await expect(state.payloadCounts()).resolves.toEqual(full);
 
     // A cutoff in the past reaches nothing.
     await expect(sysdb.garbageCollectPayloads(0)).resolves.toEqual([0, 0, 0]);
-    await expect(payloadCounts(systemDBClient)).resolves.toEqual(full);
+    await expect(state.payloadCounts()).resolves.toEqual(full);
 
     // The advisory lock is what keeps two rounds from overlapping, so a round that cannot
     // take it must collect nothing at all.
@@ -1469,14 +1432,14 @@ describe('test-list-queues', () => {
         await held!.release();
       }
       await expect(DBOS.listWorkflows({})).resolves.toHaveLength(numWorkflows);
-      await expect(payloadCounts(systemDBClient)).resolves.toEqual(full);
+      await expect(state.payloadCounts()).resolves.toEqual(full);
     }
 
     // Collect all but the newest. One round does both halves: the status sweep drops the
     // rows and the payload sweep collects what it left behind.
     await garbageCollect(sysdb, null, 1);
     await expect(DBOS.listWorkflows({})).resolves.toHaveLength(1);
-    await expect(payloadCounts(systemDBClient)).resolves.toEqual([1, 1, 1]);
+    await expect(state.payloadCounts()).resolves.toEqual([1, 1, 1]);
 
     // The survivor keeps a readable result and its checkpoints, and stays forkable.
     const survivor = (await DBOS.listWorkflows({}))[0];
@@ -1546,7 +1509,7 @@ describe('test-list-queues', () => {
       // The whole round is skipped, not just its payload half: nothing is collected.
       await garbageCollect(sysdb, Date.now() + 60_000);
       await expect(DBOS.listWorkflows({})).resolves.toHaveLength(numWorkflows);
-      await expect(payloadCounts(systemDBClient)).resolves.toEqual([numWorkflows, numWorkflows, numWorkflows]);
+      await expect(state.payloadCounts()).resolves.toEqual([numWorkflows, numWorkflows, numWorkflows]);
     } finally {
       await held!.release();
     }
@@ -1559,7 +1522,7 @@ describe('test-list-queues', () => {
     // The same round now runs to completion.
     await garbageCollect(sysdb, Date.now() + 60_000);
     await expect(DBOS.listWorkflows({})).resolves.toHaveLength(0);
-    await expect(payloadCounts(systemDBClient)).resolves.toEqual([0, 0, 0]);
+    await expect(state.payloadCounts()).resolves.toEqual([0, 0, 0]);
   });
 
   test('test-garbage-collection-spans-every-application', async () => {
@@ -1569,24 +1532,28 @@ describe('test-list-queues', () => {
     await expect(TestGarbageCollection.testWorkflow(1)).resolves.toBe(1);
     const peerID = `peer-${randomUUID()}`;
     const now = Date.now();
-    await insertPeerWorkflow(systemDBClient, peerID, now);
-
-    const peerRows = async (table: string) => {
-      const { rows } = await systemDBClient.query(`SELECT 1 FROM dbos.${table} WHERE workflow_uuid = $1`, [peerID]);
-      return rows.length;
-    };
+    // A terminal workflow belonging to another application, with its input alongside.
+    await state.insertPeerWorkflow({
+      workflowID: peerID,
+      status: StatusString.SUCCESS,
+      name: 'peerWorkflow',
+      queueName: null,
+      createdAt: now,
+      completedAt: now,
+      applicationName: 'a-different-application',
+      inputs: '{}',
+    });
 
     // One rule for every application: the payload sweep spares the payloads of any workflow
     // whose status row is still there, whoever owns it.
     await sysdb.garbageCollectPayloads(now + 60_000);
-    expect(await peerRows('workflow_input')).toBe(1);
+    expect((await state.workflowRows(peerID)).input).toBe(true);
 
     // Retention itself is system-wide, so a round this application runs collects a peer
     // application's old terminal workflow along with its payloads.
     await garbageCollect(sysdb, now + 60_000);
-    expect(await peerRows('workflow_status')).toBe(0);
-    expect(await peerRows('workflow_input')).toBe(0);
-    await expect(payloadCounts(systemDBClient)).resolves.toEqual([0, 0, 0]);
+    expect(await state.workflowRows(peerID)).toEqual({ status: false, input: false });
+    await expect(state.payloadCounts()).resolves.toEqual([0, 0, 0]);
   });
 
   test('test-payload-gc-spares-a-straggler-then-reclaims-it', async () => {
@@ -1606,8 +1573,8 @@ describe('test-list-queues', () => {
         await garbageCollect(sysdb, Date.now() + 60_000);
         await expect(DBOS.listWorkflows({})).resolves.toHaveLength(1);
         // Its input and its one checkpoint; no output yet, since it has not finished.
-        await expect(payloadCounts(systemDBClient)).resolves.toEqual([1, 0, 1]);
-        expect(await orphanedStatusRows(systemDBClient)).toEqual([0, 0]);
+        await expect(state.payloadCounts()).resolves.toEqual([1, 0, 1]);
+        expect(await state.orphanedStatusRows()).toEqual([0, 0]);
       }
       // Its inputs survived every sweep, so it still runs.
       const listed = await DBOS.listWorkflows({ workflowIDs: [blocked.workflowID] });
@@ -1620,7 +1587,7 @@ describe('test-list-queues', () => {
     // Once the status row is gone, the payload goes with it.
     await garbageCollect(sysdb, Date.now() + 60_000);
     await expect(DBOS.listWorkflows({})).resolves.toHaveLength(0);
-    await expect(payloadCounts(systemDBClient)).resolves.toEqual([0, 0, 0]);
+    await expect(state.payloadCounts()).resolves.toEqual([0, 0, 0]);
   });
 
   test('test-payload-gc-never-orphans-a-status-row', async () => {
@@ -1647,7 +1614,7 @@ describe('test-list-queues', () => {
 
       for (let round = 0; round < 3; round++) {
         await garbageCollect(sysdb, null, 2);
-        expect(await orphanedStatusRows(systemDBClient)).toEqual([0, 0]);
+        expect(await state.orphanedStatusRows()).toEqual([0, 0]);
         // Enforced, not assumed: the delayed row starting would take it out of this population.
         const status = await delayed.getStatus();
         expect(status?.status).toBe(StatusString.DELAYED);
@@ -1660,7 +1627,7 @@ describe('test-list-queues', () => {
       TestGarbageCollection.event.set();
     }
     await expect(blocked.getResult()).resolves.toBe(blocked.workflowID);
-    expect(await orphanedStatusRows(systemDBClient)).toEqual([0, 0]);
+    expect(await state.orphanedStatusRows()).toEqual([0, 0]);
   });
 
   test('[postgres-only] test-payload-gc-batches-by-watermark', async () => {
@@ -1674,7 +1641,7 @@ describe('test-list-queues', () => {
     }
     // Drop the status rows only, leaving every payload orphaned for the sweep to find.
     await systemDBClient.query(`DELETE FROM dbos.workflow_status`);
-    await expect(payloadCounts(systemDBClient)).resolves.toEqual([numWorkflows, numWorkflows, numWorkflows]);
+    await expect(state.payloadCounts()).resolves.toEqual([numWorkflows, numWorkflows, numWorkflows]);
 
     // A batch smaller than the table forces the watermark loop to run more than once. The
     // sweep's deletes name workflow_status in their anti-join, so the interceptor sees them.
@@ -1695,7 +1662,7 @@ describe('test-list-queues', () => {
     }
     // One delete per full batch, plus the final remainder delete
     expect(statements.filter(isInputDelete).length).toBe(Math.floor(numWorkflows / 2) + 1);
-    await expect(payloadCounts(systemDBClient)).resolves.toEqual([0, 0, 0]);
+    await expect(state.payloadCounts()).resolves.toEqual([0, 0, 0]);
   });
 
   class TestGlobalTimeout {
@@ -1759,7 +1726,7 @@ describe('legacy-payload-rows', () => {
     await DBOS.shutdown();
   });
 
-  test('test-legacy-payload-rows-still-read', async () => {
+  test('[postgres-only] test-legacy-payload-rows-still-read', async () => {
     const sysdb = DBOSExecutor.globalInstance!.systemDatabase as PostgresSystemDatabase;
 
     await expect(LegacyPayload.workflow(11)).resolves.toBe(11);
