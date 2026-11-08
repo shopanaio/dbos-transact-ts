@@ -135,6 +135,28 @@ describe('persisted queue control and readiness', () => {
     );
   });
 
+  test('activity checks preserve application scope, unclaimed work and every live status', async () => {
+    const q = await queue();
+    const scoped = await client(APP);
+    const foreign = await client('other-app');
+    expect(await scoped.hasActiveQueueWork([])).toBe(false);
+    for (const status of ['ENQUEUED', 'PENDING', 'DELAYED']) {
+      const id = await insert(q.name, { status });
+      expect(await scoped.hasActiveQueueWork([q.name, q.name])).toBe(true);
+      expect(await foreign.hasActiveQueueWork([q.name])).toBe(false);
+      expect(await foreign.hasActiveQueueWork([q.name], [APP])).toBe(true);
+      expect(await scoped.hasActiveQueueWork(['another-queue'])).toBe(false);
+      await db.pool.query('DELETE FROM dbos.workflow_status WHERE workflow_uuid=$1', [id]);
+      const unclaimed = await insert(q.name, { status, app: null });
+      expect(await foreign.hasActiveQueueWork([q.name])).toBe(true);
+      await db.pool.query('DELETE FROM dbos.workflow_status WHERE workflow_uuid=$1', [unclaimed]);
+    }
+    for (const status of ['SUCCESS', 'ERROR', 'CANCELLED', 'MAX_RECOVERY_ATTEMPTS_EXCEEDED']) {
+      await insert(q.name, { status });
+    }
+    expect(await scoped.hasActiveQueueWork([q.name])).toBe(false);
+  });
+
   test('SC-qp03/09: DBOSClient without listener notifies once per actual state change', async () => {
     const q = await queue();
     const c = await client(APP);

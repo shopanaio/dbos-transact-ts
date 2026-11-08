@@ -5387,6 +5387,28 @@ export class SystemDatabase {
     if (!rows[0] || rows[0].paused) throw new QueueUnavailableError(queue.name);
   }
 
+  /** Queue activity is an existence read, not a sorted workflow-history listing. */
+  async hasActiveQueueWork(queueNames: readonly string[], applicationName?: string | string[]): Promise<boolean> {
+    if (queueNames.length === 0) return false;
+    const params: unknown[] = [[...new Set(queueNames)]];
+    const scope = this.#observabilityFilter('application_name', applicationName, params);
+    const { rows } = await this.observabilityQuery((client) =>
+      client.query<{ active: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM "${this.schemaName}".workflow_status
+           WHERE queue_name = ANY($1::text[])
+             AND status IN ('ENQUEUED', 'PENDING') AND ${scope}
+         ) OR EXISTS (
+           SELECT 1 FROM "${this.schemaName}".workflow_status
+           WHERE queue_name = ANY($1::text[])
+             AND status = 'DELAYED' AND ${scope}
+         ) AS active`,
+        params,
+      ),
+    );
+    return rows[0]?.active ?? false;
+  }
+
   async findQueuesWithEnqueuedWorkflows(requests: QueueReadinessRequest[], appVersion: string): Promise<QueueReadinessRequest[]> {
     if (!requests.length) return [];
     const params: unknown[] = [requests.map(r => r.name), requests.map(r => r.queueId), requests.map(r => r.generation), requests.map(r => r.internal), appVersion];

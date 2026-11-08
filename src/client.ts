@@ -454,6 +454,11 @@ export class DBOSClient {
   async wakeQueue(name: string) { return this.systemDatabase.setQueuePaused(name, false); }
   async getQueueControlState(name: string) { return this.systemDatabase.getQueueControlState(name); }
 
+  /** Whether selected queues contain queued, running, or delayed work in the application scope. */
+  async hasActiveQueueWork(queueNames: readonly string[], applicationName?: string | string[]): Promise<boolean> {
+    return this.systemDatabase.hasActiveQueueWork(queueNames, applicationName);
+  }
+
   /** Retrieve a database-backed queue by name, or `null` if no row exists. */
   async retrieveQueue(name: string): Promise<WorkflowQueue | null> {
     const record = await this.systemDatabase.getQueue(name);
