@@ -345,6 +345,9 @@ describe('singleton workflows', () => {
         'first',
       );
 
+      // An active holder is returned without a colliding INSERT, which would leave a dead tuple.
+      const sysdb = client['systemDatabase'];
+      const init = jest.spyOn(sysdb, 'initWorkflowStatus');
       const handle2 = await client.enqueue<typeof SingletonTest.gatedWorkflow>(
         {
           workflowName: 'gatedWorkflow',
@@ -357,10 +360,48 @@ describe('singleton workflows', () => {
       );
 
       expect(handle2.workflowID).toBe(handle1.workflowID);
+      expect(init).not.toHaveBeenCalled();
+      init.mockRestore();
 
       SingletonTest.resolveEvent();
       expect(await handle1.getResult()).toBe('first-done');
       expect(await handle2.getResult()).toBe('first-done');
+    } finally {
+      await client.destroy();
+    }
+  });
+
+  test('client enqueue releasing deduplication on start joins only while delayed', async () => {
+    const dedupID = `client_release_on_start_${Date.now()}`;
+    const client = await DBOSClient.create({ systemDatabaseUrl });
+    const options = {
+      workflowName: 'gatedWorkflow',
+      workflowClassName: 'SingletonTest',
+      queueName: SingletonTest.queue.name,
+      deduplicationID: dedupID,
+      duplicationPolicy: 'return-existing' as const,
+      releaseDeduplicationOnStart: true,
+      delaySeconds: 3600,
+    };
+    try {
+      const first = await client.enqueue<typeof SingletonTest.gatedWorkflow>(options, 'first');
+      const joined = await client.enqueue<typeof SingletonTest.gatedWorkflow>(options, 'second');
+      expect(joined.workflowID).toBe(first.workflowID);
+
+      // Promote the delayed holder: its key is released, so the next caller starts a new workflow.
+      const sysdb = client['systemDatabase'];
+      await sysdb.pool.query(
+        `UPDATE "${sysdb.schemaName}".workflow_status SET delay_until_epoch_ms = 0 WHERE workflow_uuid = $1`,
+        [first.workflowID],
+      );
+      await sysdb.transitionDelayedWorkflows();
+      const next = await client.enqueue<typeof SingletonTest.gatedWorkflow>(options, 'third');
+      expect(next.workflowID).not.toBe(first.workflowID);
+
+      await expect(
+        client.enqueue<typeof SingletonTest.gatedWorkflow>({ ...options, delaySeconds: undefined }, 'x'),
+      ).rejects.toThrow('releaseDeduplicationOnStart');
+      SingletonTest.resolveEvent();
     } finally {
       await client.destroy();
     }

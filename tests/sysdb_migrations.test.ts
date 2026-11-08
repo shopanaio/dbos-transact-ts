@@ -128,6 +128,11 @@ describe('sysdb migration runner', () => {
     expect(await indexExists(client, 'idx_workflow_status_partition_dequeue_v2')).toBe(false);
     expect(await indexExists(client, 'idx_workflow_status_in_flight')).toBe(false);
     expect(await indexExists(client, 'idx_operation_outputs_completed_at_function_name')).toBe(false);
+    // The attributes GIN index is replaced by a store-attribute expression index.
+    expect(await indexExists(client, 'idx_workflow_status_attributes')).toBe(false);
+    expect(await indexDefinition(client, 'idx_workflow_status_store_attribute')).toContain(
+      "((attributes ->> 'shopanaStoreId'::text)), created_at)",
+    );
 
     // The duplicate notifications index is dropped; the one it duplicated stays.
     expect(await indexExists(client, 'idx_notifications')).toBe(false);

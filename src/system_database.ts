@@ -4174,11 +4174,9 @@ export class SystemDatabase {
     }
 
     // Match workflows whose attributes JSONB contains all the given key-value pairs.
-    // The `@>` containment operator is served by the GIN index on the attributes column.
     if (input.attributes && Object.keys(input.attributes).length > 0) {
-      whereClauses.push(`attributes @> $${paramCounter}::jsonb`);
-      params.push(JSON.stringify(input.attributes));
-      paramCounter++;
+      whereClauses.push(attributesFilter(input.attributes, params));
+      paramCounter = params.length + 1;
     }
 
     if (input.startTime) {
@@ -4361,9 +4359,8 @@ export class SystemDatabase {
 
     // Match workflows whose attributes JSONB contains all the given key-value pairs.
     if (input.attributes && Object.keys(input.attributes).length > 0) {
-      whereClauses.push(`attributes @> $${paramIdx}::jsonb`);
-      params.push(JSON.stringify(input.attributes));
-      paramIdx++;
+      whereClauses.push(attributesFilter(input.attributes, params));
+      paramIdx = params.length + 1;
     }
 
     if (input.startTime) {
@@ -6243,4 +6240,24 @@ export class SystemDatabase {
 
     await connect();
   }
+}
+
+const ATTRIBUTE_KEY = /^[A-Za-z][A-Za-z0-9_]*$/;
+
+/**
+ * Containment over workflow attributes. The attributes column has no GIN index (its pending-list
+ * cleanup stalled inserts), so each string value of an identifier key also adds an equality on
+ * `attributes->>'key'` that an expression index can serve; `@>` keeps the exact semantics.
+ */
+function attributesFilter(attributes: Record<string, unknown>, params: unknown[]): string {
+  const clauses: string[] = [];
+  for (const [key, value] of Object.entries(attributes)) {
+    if (typeof value === 'string' && ATTRIBUTE_KEY.test(key)) {
+      params.push(value);
+      clauses.push(`attributes->>'${key}' = $${params.length}`);
+    }
+  }
+  params.push(JSON.stringify(attributes));
+  clauses.push(`attributes @> $${params.length}::jsonb`);
+  return clauses.join(' AND ');
 }

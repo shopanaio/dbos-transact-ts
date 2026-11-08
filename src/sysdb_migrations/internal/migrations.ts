@@ -1137,5 +1137,21 @@ $$ LANGUAGE plpgsql;`,
       name: '121_queue_pause',
       pg: [`ALTER TABLE "${schemaName}".queues ADD COLUMN paused BOOLEAN NOT NULL DEFAULT false`],
     },
+    // Serves the store-scoped observability filter (`attributes->>'shopanaStoreId' = ...`) that
+    // replaces the GIN index below.
+    {
+      name: '122_workflow_status_store_attribute_index',
+      online: true,
+      pg: [
+        `CREATE INDEX ${isCockroach ? '' : 'CONCURRENTLY'} IF NOT EXISTS "idx_workflow_status_store_attribute" ON "${schemaName}"."workflow_status" (("attributes"->>'shopanaStoreId'), "created_at") WHERE "attributes" IS NOT NULL`,
+      ],
+    },
+    // Every non-HOT row version re-inserted all attribute keys and values into this GIN index,
+    // and the writer overflowing its pending list cleaned it synchronously for seconds.
+    {
+      name: '123_drop_workflow_status_attributes_index',
+      online: true,
+      pg: [`DROP INDEX ${isCockroach ? '' : 'CONCURRENTLY'} IF EXISTS "${schemaName}"."idx_workflow_status_attributes"`],
+    },
   ];
 }

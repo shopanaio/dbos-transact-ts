@@ -82,6 +82,13 @@ export interface ClientEnqueueOptions extends EnqueueWorkflowOptions {
    *     and the handle resolves with the original workflow's result.
    */
   duplicationPolicy?: DuplicationPolicy;
+  /**
+   * Hold `deduplicationID` only while the workflow is DELAYED and release it when the workflow is
+   * enqueued, as a debounce key is. Callers inside the delay join one workflow; a caller after it
+   * starts a new one, so a workflow that reads current state never misses a later change.
+   * Requires `deduplicationID` and a positive `delaySeconds`.
+   */
+  releaseDeduplicationOnStart?: boolean;
 }
 
 /**
@@ -238,6 +245,14 @@ export class DBOSClient {
     ...args: Parameters<T>
   ): Promise<WorkflowHandle<Awaited<ReturnType<T>>>> {
     const internalStatus = await this.#buildEnqueueStatus(options, args);
+    if (options.releaseDeduplicationOnStart) {
+      if (!options.deduplicationID || !(options.delaySeconds !== undefined && options.delaySeconds > 0)) {
+        throw new DBOSInvalidWorkflowTransitionError(
+          '`releaseDeduplicationOnStart` requires `deduplicationID` and a positive `delaySeconds`',
+        );
+      }
+      internalStatus.isDebounced = true;
+    }
 
     let finalID: string;
     if (options.duplicationPolicy === 'return-existing') {
@@ -303,12 +318,15 @@ export class DBOSClient {
    * Insert the workflow status row under the `'return-existing'` duplication policy: a retry
    * loop that catches `DBOSQueueDuplicatedError`, looks up the active workflow holding the
    * dedup slot, and returns its UUID. Falls back to retry if the slot was cleared between
-   * INSERT and lookup (the prior workflow completed or was cancelled mid-flight).
+   * INSERT and lookup (the prior workflow completed or was cancelled mid-flight). The holder is
+   * looked up first as well: a colliding INSERT leaves a dead heap tuple and index entries behind.
    */
   async #initSingletonWorkflow(internalStatus: WorkflowStatusInternal, options: ClientEnqueueOptions): Promise<string> {
     if (!options.deduplicationID) {
       throw new DBOSInvalidWorkflowTransitionError("`duplicationPolicy: 'return-existing'` requires `deduplicationID`");
     }
+    const holderID = await this.systemDatabase.getDeduplicatedWorkflow(options.queueName, options.deduplicationID);
+    if (holderID) return holderID;
     while (true) {
       try {
         await this.systemDatabase.initWorkflowStatus(internalStatus, null);
