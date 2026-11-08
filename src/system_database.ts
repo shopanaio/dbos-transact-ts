@@ -5405,7 +5405,9 @@ export class SystemDatabase {
         WHERE q.name = r.name AND q.queue_id::text = r.queue_id AND NOT q.paused AND ${queuesScope}
       )) AND EXISTS (
         SELECT 1 FROM "${this.schemaName}".workflow_status w
-        WHERE w.queue_name = r.name AND w.status = 'ENQUEUED' AND ${workflows}
+        -- Keep the batch bound explicit: sparse owners otherwise trigger scans of workflow history.
+        WHERE w.queue_name = r.name AND w.queue_name = ANY($1::text[])
+          AND w.status = 'ENQUEUED' AND ${workflows}
           AND (w.application_version = $5 OR (w.application_version IS NULL
             AND ((SELECT version_name FROM latest) IS NULL OR (SELECT version_name FROM latest) = $5)))
         LIMIT 1

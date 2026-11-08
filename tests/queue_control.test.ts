@@ -311,6 +311,36 @@ describe('persisted queue control and readiness', () => {
     expect(query).not.toHaveBeenCalled();
   });
 
+  test('readiness probes an empty queue by index despite a large foreign backlog', async () => {
+    const q = await queue();
+    await db.pool.query(`INSERT INTO dbos.workflow_status
+      (workflow_uuid, name, status, queue_name, application_name, application_version)
+      SELECT 'probe-history-' || n, 'probeHistory',
+        CASE WHEN n % 4 = 0 THEN 'SUCCESS' ELSE 'ENQUEUED' END,
+        'foreign-backlog', 'foreign-app', 'foreign-version'
+      FROM generate_series(1, 20000) AS series(n)`);
+    await db.pool.query('ANALYZE dbos.workflow_status');
+    const query = jest.spyOn(db.pool, 'query');
+    expect(await db.findQueuesWithEnqueuedWorkflows([request(q)], version())).toEqual([]);
+    const probe = query.mock.calls.find((call) => typeof call[0] === 'string' && call[0].includes('WITH latest'));
+    expect(probe).toBeDefined();
+    const [text, parameters] = probe as unknown as [string, unknown[]];
+    const { rows } = await observer.query(`EXPLAIN (FORMAT JSON) ${text}`, parameters);
+    const scans: string[] = [];
+    function visit(plan: Record<string, unknown>) {
+      if (plan['Relation Name'] === 'workflow_status') scans.push(String(plan['Node Type']));
+      for (const child of (plan.Plans ?? []) as Record<string, unknown>[]) visit(child);
+    }
+    visit(rows[0]['QUERY PLAN'][0].Plan);
+    expect(scans.length).toBeGreaterThan(0);
+    expect(scans.some((scan) => scan.includes('Seq Scan'))).toBe(false);
+    // Observing another application's backlog must not claim or mutate its workflows.
+    const backlog = await observer.query(
+      "SELECT count(*)::int AS n FROM dbos.workflow_status WHERE application_name='foreign-app' AND status='ENQUEUED'",
+    );
+    expect(backlog.rows[0].n).toBe(15000);
+  });
+
   test.each(['latest', 'old', 'unregistered', 'nameless'])(
     'SC-qp06: readiness preserves %s version and ownership semantics',
     async (mode) => {
