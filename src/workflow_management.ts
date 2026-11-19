@@ -1,3 +1,4 @@
+import { DBOSError } from './error';
 import type { SystemDatabase, WorkflowStatusInternal } from './system_database';
 import type { StepInfo, WorkflowStatus, GetWorkflowsInput, ListWorkflowStepsOptions } from './workflow';
 import { DBOSSerializer, safeParse, safeParseError, safeParsePositionalArgs } from './serialization';
@@ -123,24 +124,14 @@ export async function garbageCollect(
   ) {
     return;
   }
-  const lock = await sysdb.acquireRetentionLock();
-  if (!lock) {
-    sysdb.logger.warn('Skipping retention: another round is already running against this system database.');
-    return;
+  // PostgreSQL history is fenced against ID reuse until its business checkpoints are gone, and only
+  // the control plane can reach those (retainWorkflowHistory with a transaction pool).
+  const { rows: dialect } = await sysdb.pool.query<{ version: string }>('SELECT version() AS version');
+  if (!/cockroachdb/i.test(dialect[0]?.version ?? '')) {
+    throw new DBOSError('PostgreSQL workflow history retention is run by the workflow control plane');
   }
-  try {
-    // Both sweeps take the same batch size, and both default it the same way when unset.
-    const batchSize = options.batchSize ?? undefined;
-    const cutoff = await sysdb.garbageCollect(cutoffEpochTimestampMs, rowsThreshold, { batchSize });
-    if (cutoff === undefined) {
-      return;
-    }
-    // Strictly after the status sweep: the payload sweep only takes orphans, so this round's
-    // are only visible to it once that sweep has committed.
-    await sysdb.garbageCollectPayloads(cutoff, batchSize);
-  } finally {
-    await lock.release();
-  }
+  const cutoff = await sysdb.garbageCollect(cutoffEpochTimestampMs, rowsThreshold, options);
+  if (cutoff !== undefined) await sysdb.garbageCollectPayloads(cutoff, options.batchSize ?? undefined);
 }
 
 export async function globalTimeout(sysdb: SystemDatabase, cutoffEpochTimestampMs: number): Promise<void> {

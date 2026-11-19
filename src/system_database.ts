@@ -1,3 +1,4 @@
+import { collectHistoryStatusBatch, collectHistoryPayloadBatch, historyMutationLockKey } from './history_retention';
 import { DBOSExecutor } from './dbos-executor';
 import { DatabaseError, Pool, PoolClient, Notification, Client, PoolConfig, ClientBase } from 'pg';
 import {
@@ -35,7 +36,7 @@ import {
 } from './utils';
 import { GlobalLogger } from './telemetry/logs';
 import { QueueRateLimit, WorkflowQueue } from './wfqueue';
-import { createHash, randomUUID } from 'crypto';
+import { randomUUID } from 'crypto';
 import { getClientConfig } from './utils';
 import { ensurePGDatabase, maskDatabaseUrl } from './database_utils';
 import { getCurrentSysDBVersion, runSysMigrationsPg } from './sysdb_migrations/migration_runner';
@@ -177,7 +178,10 @@ export interface QueueControlState {
 }
 
 export class QueueControlError extends Error {
-  constructor(public readonly code: 'QUEUE_NOT_FOUND' | 'INTERNAL_QUEUE' | 'QUEUE_OWNER_MISMATCH', name: string) {
+  constructor(
+    public readonly code: 'QUEUE_NOT_FOUND' | 'INTERNAL_QUEUE' | 'QUEUE_OWNER_MISMATCH',
+    name: string,
+  ) {
     super(`${code}: ${name}`);
     this.name = 'QueueControlError';
   }
@@ -517,16 +521,6 @@ async function releaseSystemDatabaseClient(client: ClientBase, customPool?: Pool
       await (client as Client).end();
     }
   } catch (e) {}
-}
-
-/**
- * The pg_try_advisory_lock argument for one schema's retention round: the leading 8 bytes of
- * SHA-256 over a fixed string, read as a signed big-endian 64-bit integer. Separate locks for
- * separate schemas. Every DBOS SDK derives the key this way, so rounds in different languages
- * against one system database contend for the same lock; changing it here changes it everywhere.
- */
-export function retentionLockKey(schemaName: string): bigint {
-  return createHash('sha256').update(`dbos.retention.${schemaName}`).digest().readBigInt64BE(0);
 }
 
 async function isCockroachDB(client: ClientBase): Promise<boolean> {
@@ -1910,8 +1904,14 @@ export class SystemDatabase {
   }
 
   async resumeWorkflows(workflowIDs: string[], queueName?: string): Promise<void> {
-    await this.pool.query(
-      `UPDATE "${this.schemaName}".workflow_status
+    const client = await this.#connect();
+    try {
+      await client.query('BEGIN');
+      if (!(this.#isCockroach ??= await isCockroachDB(client))) {
+        await client.query('SELECT pg_advisory_xact_lock_shared($1)', [historyMutationLockKey(this.schemaName)]);
+      }
+      await client.query(
+        `UPDATE "${this.schemaName}".workflow_status
        SET status = $1, queue_name = COALESCE($2, queue_name, $6), recovery_attempts = 0,
            workflow_deadline_epoch_ms = NULL, deduplication_id = NULL,
            started_at_epoch_ms = NULL,
@@ -1919,8 +1919,22 @@ export class SystemDatabase {
            completed_at = NULL
        WHERE workflow_uuid = ANY($3)
          AND status NOT IN ($4, $5)`,
-      [StatusString.ENQUEUED, queueName ?? null, workflowIDs, StatusString.SUCCESS, StatusString.ERROR, INTERNAL_QUEUE_NAME],
-    );
+        [
+          StatusString.ENQUEUED,
+          queueName ?? null,
+          workflowIDs,
+          StatusString.SUCCESS,
+          StatusString.ERROR,
+          INTERNAL_QUEUE_NAME,
+        ],
+      );
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 
   async setWorkflowPriority(workflowID: string, priority: number): Promise<void> {
@@ -2220,6 +2234,10 @@ export class SystemDatabase {
     try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
 
+      if (!(this.#isCockroach ??= await isCockroachDB(client))) {
+        await client.query('SELECT pg_advisory_xact_lock_shared($1)', [historyMutationLockKey(this.schemaName)]);
+      }
+
       // Fetch the status of all original workflows inside the transaction.
       const { rows: statusRows } = await client.query<workflow_status>(
         `SELECT ws.workflow_uuid, ws.name, ws.class_name, ws.config_name, ws.application_id,
@@ -2228,7 +2246,8 @@ export class SystemDatabase {
                 ws.application_version, ws.attributes, ws.application_name
          FROM "${this.schemaName}".workflow_status ws
          LEFT JOIN "${this.schemaName}".workflow_input wi ON wi.workflow_uuid = ws.workflow_uuid
-         WHERE ws.workflow_uuid = ANY($1)`,
+         WHERE ws.workflow_uuid = ANY($1)
+           AND NOT EXISTS (SELECT 1 FROM "${this.schemaName}".history_gc_pending gc WHERE gc.workflow_uuid=ws.workflow_uuid)`,
         [originalWorkflowIDs],
       );
 
@@ -2435,6 +2454,10 @@ export class SystemDatabase {
 
     const client = await this.#connect();
     try {
+      await client.query('BEGIN');
+      if (!(this.#isCockroach ??= await isCockroachDB(client))) {
+        await client.query('SELECT pg_advisory_xact_lock_shared($1)', [historyMutationLockKey(this.schemaName)]);
+      }
       for (const wfID of workflowIDs) {
         // Export workflow_status
         const statusResult = await client.query<workflow_status>(
@@ -2457,7 +2480,8 @@ export class SystemDatabase {
           FROM "${this.schemaName}".workflow_status ws
           LEFT JOIN "${this.schemaName}".workflow_input wi ON wi.workflow_uuid = ws.workflow_uuid
           LEFT JOIN "${this.schemaName}".workflow_output wo ON wo.workflow_uuid = ws.workflow_uuid
-          WHERE ws.workflow_uuid = $1`,
+          WHERE ws.workflow_uuid = $1
+            AND NOT EXISTS (SELECT 1 FROM "${this.schemaName}".history_gc_pending gc WHERE gc.workflow_uuid=ws.workflow_uuid)`,
           [wfID],
         );
 
@@ -2510,6 +2534,10 @@ export class SystemDatabase {
           streams: streamsResult.rows,
         });
       }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
     } finally {
       client.release();
     }
@@ -2521,6 +2549,9 @@ export class SystemDatabase {
     const client = await this.#connect();
     try {
       await client.query('BEGIN');
+      if (!(this.#isCockroach ??= await isCockroachDB(client))) {
+        await client.query('SELECT pg_advisory_xact_lock_shared($1)', [historyMutationLockKey(this.schemaName)]);
+      }
 
       for (const workflow of workflows) {
         const status = workflow.workflow_status;
@@ -4566,156 +4597,32 @@ export class SystemDatabase {
     return this.#isCockroach;
   }
 
-  /**
-   * Take a database-wide lock for one retention round, returning how to release it, or
-   * undefined when another round already holds it. The lock is session-scoped, so a round
-   * that crashes releases it. CockroachDB has no advisory locks and always takes it, so it
-   * collects unprotected rather than not at all.
-   */
-  async acquireRetentionLock(): Promise<{ release: () => Promise<void> } | undefined> {
-    if (await this.#cockroach()) {
-      return { release: () => Promise.resolve() };
-    }
-    const key = retentionLockKey(this.schemaName).toString();
-    // The round holds this connection until it ends: releasing it would drop the lock.
-    const client = await this.#borrowRetentionClient();
-    let acquired = false;
-    try {
-      const { rows } = await client.query<{ locked: boolean }>('SELECT pg_try_advisory_lock($1) AS locked', [key]);
-      acquired = rows[0]?.locked === true;
-    } catch (e) {
-      this.#releaseRetentionClient(client);
-      throw e;
-    }
-    if (!acquired) {
-      this.#releaseRetentionClient(client);
-      return undefined;
-    }
-    return {
-      release: async () => {
-        // Already cut by destroy(): the session is gone and took the lock with it.
-        if (!this.#retentionClients.has(client)) {
-          return;
-        }
-        try {
-          // Explicit, since releasing the client only returns the session to the pool.
-          const { rows } = await client.query<{ released: boolean }>('SELECT pg_advisory_unlock($1) AS released', [
-            key,
-          ]);
-          if (rows[0]?.released !== true) {
-            // False means this session no longer holds it, which a transaction-pooling proxy
-            // causes by switching backends.
-            this.logger.warn(
-              'Could not release the retention lock: this session no longer holds it. Retention will ' +
-                'not proceed until the lock is released, which happens when the holding backend closes. ' +
-                'A transaction-pooling proxy in front of Postgres causes this; run DBOS through a ' +
-                'session-pooled or direct connection.',
-            );
-          }
-        } finally {
-          this.#releaseRetentionClient(client);
-        }
-      },
-    };
-  }
-
-  /** VACUUM the tables a sweep dirtied. No-op where there is no autovacuum to outrun. */
-  async #vacuumTables(tables: readonly string[]): Promise<void> {
-    if (await this.#cockroach()) {
-      return;
-    }
-    const client = await this.#borrowRetentionClient();
-    let notices: string[] = [];
-    const onNotice = (notice: { message?: string }) => notices.push(notice.message ?? '');
-    client.on('notice', onNotice);
-    try {
-      for (const table of tables) {
-        // Per table, so one refusal does not skip the rest.
-        notices = [];
-        try {
-          await client.query(`VACUUM (INDEX_CLEANUP ON, TRUNCATE OFF, ANALYZE) "${this.schemaName}"."${table}"`);
-        } catch (e) {
-          if (!this.#retentionClients.has(client)) {
-            throw e;
-          }
-          this.logger.warn(`Payload retention could not vacuum ${table}: ${(e as Error).message}`);
-          continue;
-        }
-        // A refused or stalled VACUUM does not raise, it says so in a notice; a successful
-        // one is silent, so anything here is worth surfacing.
-        for (const notice of notices) {
-          this.logger.warn(`Payload retention vacuuming ${table}: ${notice}`);
-        }
-      }
-    } finally {
-      client.removeListener('notice', onNotice);
-      this.#releaseRetentionClient(client);
-    }
-  }
-
   /** Delete one payload table's orphans below the cutoff, one batch per transaction. */
-  async #garbageCollectTable(table: string, cutoff: number, batchSize: number): Promise<number> {
-    // A payload below the cutoff belongs to a workflow created before it, so the status side
-    // is the few such rows still present, not the whole table.
-    const orphaned = `NOT EXISTS (
-             SELECT 1 FROM "${this.schemaName}".workflow_status ws
-             WHERE ws.workflow_uuid = t.workflow_uuid AND ws.created_at < $1
-           )`;
-
-    // Seed from the oldest row in range.
-    const oldest = await retryOnSerializationError(async () => {
-      const { rows } = await this.pool.query<{ retention_timestamp: string }>(
-        `SELECT retention_timestamp
-           FROM "${this.schemaName}".${table}
-          WHERE retention_timestamp < $1
-          ORDER BY retention_timestamp
-          LIMIT 1`,
-        [cutoff],
-      );
-      // retention_timestamp is a bigint, so node-postgres hands it back as a string.
-      return rows.length > 0 ? Number(rows[0].retention_timestamp) : undefined;
-    });
-    if (oldest === undefined) {
-      return 0;
-    }
-
+  async #garbageCollectTable(
+    table: 'workflow_input' | 'workflow_output' | 'operation_outputs',
+    cutoff: number,
+    batchSize: number,
+  ): Promise<number> {
+    let cursor = { key: '', number: -1 };
     let total = 0;
-    let watermark = oldest - 1;
     for (;;) {
-      const batch = await retryOnSerializationError(async () => {
-        // Borrowed rather than pool.query'd: that releases with the error, which discards the
-        // connection on a deadlock, so the retry wrapping this would churn the pool per batch.
-        const client = await this.#borrowRetentionClient();
-        try {
-          // Batches are cut by candidate count, so rows spared by the anti-join only thin one
-          // out; they are re-checked next round.
-          const { rows } = await client.query<{ retention_timestamp: string }>(
-            `SELECT retention_timestamp
-               FROM "${this.schemaName}".${table}
-              WHERE retention_timestamp < $1 AND retention_timestamp > $2
-              ORDER BY retention_timestamp
-              LIMIT 1 OFFSET ${batchSize - 1}`,
-            [cutoff, watermark],
-          );
-          const step = rows.length > 0 ? Number(rows[0].retention_timestamp) : undefined;
-          const params: unknown[] = [cutoff, watermark];
-          // Timestamp ties may push the batch slightly over batchSize, but never split across two.
-          const upperBound = step === undefined ? '' : `AND t.retention_timestamp <= $${params.push(step)} `;
-          const result = await client.query(
-            `DELETE FROM "${this.schemaName}".${table} t
-             WHERE t.retention_timestamp < $1 AND t.retention_timestamp > $2 ${upperBound}AND ${orphaned}`,
-            params,
-          );
-          return { step, deleted: result.rowCount ?? 0 };
-        } finally {
-          this.#releaseRetentionClient(client);
+      const client = await this.#borrowRetentionClient();
+      try {
+        await client.query('BEGIN');
+        if (!(this.#isCockroach ??= await isCockroachDB(client))) {
+          await client.query('SELECT pg_advisory_xact_lock($1)', [historyMutationLockKey(this.schemaName)]);
         }
-      });
-      total += batch.deleted;
-      if (batch.step === undefined) {
-        return total;
+        const result = await collectHistoryPayloadBatch(client, this.schemaName, table, cutoff, batchSize, cursor);
+        await client.query('COMMIT');
+        total += result.deleted;
+        if (result.done) return total;
+        cursor = { key: result.key, number: result.number };
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        this.#releaseRetentionClient(client);
       }
-      watermark = batch.step;
     }
   }
 
@@ -4729,10 +4636,9 @@ export class SystemDatabase {
     if (!Number.isInteger(batchSize) || batchSize < 1) {
       throw new DBOSError(`batchSize must be a positive integer, got ${batchSize}`);
     }
-    const tables = ['workflow_input', 'workflow_output', 'operation_outputs'];
+    const tables = ['workflow_input', 'workflow_output', 'operation_outputs'] as const;
 
-    // To optimize performance, vacuum payload tables both before and after collecting them.
-    await this.#vacuumTables(['workflow_status', ...tables]);
+    // Autovacuum reclaims reusable space; retention does not run blocking compaction.
 
     // One connection per concurrent sweep, on top of the one the retention lock holds for the
     // whole round. A pool too small for all three runs them sequentially rather than leaving
@@ -4765,7 +4671,6 @@ export class SystemDatabase {
       throw failures[0];
     }
 
-    await this.#vacuumTables(tables);
     this.logger.debug(`Payload retention deleted ${deleted[0]} inputs, ${deleted[1]} outputs, and ${deleted[2]} steps`);
     return deleted;
   }
@@ -4788,39 +4693,29 @@ export class SystemDatabase {
   async #garbageCollectBatch(
     cutoffEpochTimestampMs: number,
     batchSize: number,
-    watermark: number,
-  ): Promise<number | undefined> {
-    // Borrowed rather than pool.query'd: that releases with the error, which discards the
-    // connection on a deadlock, so the retry wrapping this would churn the pool per batch.
+    watermark: { key: string; number: number },
+  ): Promise<{ key: string; number: number } | undefined> {
     const client = await this.#borrowRetentionClient();
     try {
-      // The batchSize-th oldest eligible row above the watermark bounds this range
-      const stepParams: unknown[] = [];
-      const stepScope = this.#gcFilter(cutoffEpochTimestampMs, stepParams);
-      stepParams.push(watermark);
-      const stepResult = await client.query<{ completed_at: string }>(
-        `SELECT completed_at
-           FROM "${this.schemaName}".workflow_status
-          WHERE ${stepScope} AND completed_at > $${stepParams.length}
-          ORDER BY completed_at
-          LIMIT 1 OFFSET ${batchSize - 1}`,
-        stepParams,
-      );
-      // completed_at is a bigint, so node-postgres hands it back as a string.
-      const step = stepResult.rows.length > 0 ? Number(stepResult.rows[0].completed_at) : undefined;
-
-      const deleteParams: unknown[] = [];
-      let deleteScope = this.#gcFilter(cutoffEpochTimestampMs, deleteParams);
-      if (step !== undefined) {
-        // Inclusive upper bound: completed_at ties may push a batch over batchSize, but never split across two.
-        deleteParams.push(watermark, step);
-        deleteScope = `${deleteScope} AND completed_at > $${deleteParams.length - 1} AND completed_at <= $${deleteParams.length}`;
+      await client.query('BEGIN');
+      if (!(this.#isCockroach ??= await isCockroachDB(client))) {
+        await client.query('SELECT pg_advisory_xact_lock($1)', [historyMutationLockKey(this.schemaName)]);
       }
-      // The final batch drops the watermark: unbounded, since an import can land a
-      // completed_at below it mid-pass.
-      await client.query(`DELETE FROM "${this.schemaName}".workflow_status WHERE ${deleteScope}`, deleteParams);
-
-      return step;
+      const result = await collectHistoryStatusBatch(
+        client,
+        this.schemaName,
+        {
+          systemCutoffEpochMs: cutoffEpochTimestampMs,
+          batchSize,
+        },
+        watermark,
+        false,
+      );
+      await client.query('COMMIT');
+      return result.done ? undefined : { key: result.key, number: result.number };
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
     } finally {
       this.#releaseRetentionClient(client);
     }
@@ -4892,7 +4787,7 @@ export class SystemDatabase {
       return rows.length > 0 ? Number(rows[0].completed_at) : undefined;
     });
 
-    let watermark = oldest === undefined ? 0 : oldest - 1;
+    let watermark = { key: '', number: oldest === undefined ? -1 : oldest - 1 };
     for (;;) {
       const next = await retryOnSerializationError(() => this.#garbageCollectBatch(cutoff, batchSize, watermark));
       // Fewer than a full batch remained, so that delete took the rest.
@@ -5344,7 +5239,9 @@ export class SystemDatabase {
 
   async getQueueControlState(name: string): Promise<QueueControlState> {
     const { rows } = await this.pool.query<queues>(
-      `SELECT ${QUEUE_COLUMNS} FROM "${this.schemaName}".queues WHERE name = $1`, [name]);
+      `SELECT ${QUEUE_COLUMNS} FROM "${this.schemaName}".queues WHERE name = $1`,
+      [name],
+    );
     this.validateControlRow(name, rows[0]);
     return { name, queueId: rows[0].queue_id, paused: rows[0].paused };
   }
@@ -5355,14 +5252,20 @@ export class SystemDatabase {
     try {
       await client.query('BEGIN');
       const { rows } = await client.query<queues>(
-        `SELECT ${QUEUE_COLUMNS} FROM "${this.schemaName}".queues WHERE name = $1 FOR UPDATE`, [name]);
+        `SELECT ${QUEUE_COLUMNS} FROM "${this.schemaName}".queues WHERE name = $1 FOR UPDATE`,
+        [name],
+      );
       this.validateControlRow(name, rows[0]);
       const row = rows[0];
       if (row.paused !== paused) {
-        await client.query(`UPDATE "${this.schemaName}".queues SET paused = $2 WHERE queue_id = $1 RETURNING paused`, [row.queue_id, paused]);
+        await client.query(`UPDATE "${this.schemaName}".queues SET paused = $2 WHERE queue_id = $1 RETURNING paused`, [
+          row.queue_id,
+          paused,
+        ]);
         if (this.queueControlNotificationsEnabled && !(await isCockroachDB(client))) {
           let payload = JSON.stringify({ schema: this.schemaName, queueId: row.queue_id, name });
-          if (Buffer.byteLength(payload) > 7000) payload = JSON.stringify({ schema: this.schemaName, queueId: row.queue_id });
+          if (Buffer.byteLength(payload) > 7000)
+            payload = JSON.stringify({ schema: this.schemaName, queueId: row.queue_id });
           await client.query('SELECT pg_notify($1, $2)', ['dbos_queue_control_channel', payload]);
         }
       }
@@ -5372,7 +5275,9 @@ export class SystemDatabase {
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw error;
-    } finally { client.release(); }
+    } finally {
+      client.release();
+    }
   }
 
   private async guardQueueClaim(client: PoolClient, queue: WorkflowQueue): Promise<void> {
@@ -5380,7 +5285,9 @@ export class SystemDatabase {
     const params: unknown[] = [queue.name, queue.queueId];
     const scope = this.#appNameFilter('application_name', this.appName, params);
     const { rows } = await client.query<{ paused: boolean }>(
-      `SELECT paused FROM "${this.schemaName}".queues WHERE name = $1 AND queue_id = $2 AND ${scope} FOR SHARE`, params);
+      `SELECT paused FROM "${this.schemaName}".queues WHERE name = $1 AND queue_id = $2 AND ${scope} FOR SHARE`,
+      params,
+    );
     if (!rows[0] || rows[0].paused) throw new QueueUnavailableError(queue.name);
   }
 
@@ -5406,13 +5313,23 @@ export class SystemDatabase {
     return rows[0]?.active ?? false;
   }
 
-  async findQueuesWithEnqueuedWorkflows(requests: QueueReadinessRequest[], appVersion: string): Promise<QueueReadinessRequest[]> {
+  async findQueuesWithEnqueuedWorkflows(
+    requests: QueueReadinessRequest[],
+    appVersion: string,
+  ): Promise<QueueReadinessRequest[]> {
     if (!requests.length) return [];
-    const params: unknown[] = [requests.map(r => r.name), requests.map(r => r.queueId), requests.map(r => r.generation), requests.map(r => r.internal), appVersion];
+    const params: unknown[] = [
+      requests.map((r) => r.name),
+      requests.map((r) => r.queueId),
+      requests.map((r) => r.generation),
+      requests.map((r) => r.internal),
+      appVersion,
+    ];
     const versions = this.#appNameFilter('application_name', this.appName, params);
     const workflows = this.#appNameFilter('w.application_name', this.appName, params);
     const queuesScope = this.#appNameFilter('q.application_name', this.appName, params);
-    const { rows } = await this.pool.query<QueueReadinessRequest>(`
+    const { rows } = await this.pool.query<QueueReadinessRequest>(
+      `
       WITH latest AS MATERIALIZED (
         SELECT version_name FROM "${this.schemaName}".application_versions
         WHERE ${versions} ORDER BY version_timestamp DESC LIMIT 1
@@ -5430,10 +5347,11 @@ export class SystemDatabase {
           AND (w.application_version = $5 OR (w.application_version IS NULL
             AND ((SELECT version_name FROM latest) IS NULL OR (SELECT version_name FROM latest) = $5)))
         LIMIT 1
-      )`, params);
+      )`,
+      params,
+    );
     return rows;
   }
-
 
   async getQueue(name: string): Promise<QueueRecord | null> {
     const { rows } = await this.pool.query<queues>(
@@ -6210,8 +6128,11 @@ export class SystemDatabase {
           if (msg.channel === 'dbos_queue_control_channel' && msg.payload) {
             try {
               const hint = JSON.parse(msg.payload) as { schema?: string; name?: string };
-              if (hint.schema === this.schemaName) for (const listener of this.queueControlListeners) listener(hint.name);
-            } catch { /* Invalid hints never change persisted state. */ }
+              if (hint.schema === this.schemaName)
+                for (const listener of this.queueControlListeners) listener(hint.name);
+            } catch {
+              /* Invalid hints never change persisted state. */
+            }
           } else if (msg.channel === DBOS_NOTIFICATIONS_CHANNEL && msg.payload) {
             this.notificationsMap.callCallbacks(msg.payload);
           } else if (msg.channel === DBOS_WORKFLOW_EVENTS_CHANNEL && msg.payload) {

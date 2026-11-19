@@ -1,3 +1,4 @@
+import { historyMutationLockKey } from '../../history_retention';
 import { SHARED_MIGRATION_BASE, type DBMigration } from '../migration_runner';
 
 export { SHARED_MIGRATION_BASE };
@@ -1151,7 +1152,67 @@ $$ LANGUAGE plpgsql;`,
     {
       name: '123_drop_workflow_status_attributes_index',
       online: true,
-      pg: [`DROP INDEX ${isCockroach ? '' : 'CONCURRENTLY'} IF EXISTS "${schemaName}"."idx_workflow_status_attributes"`],
+      pg: [
+        `DROP INDEX ${isCockroach ? '' : 'CONCURRENTLY'} IF EXISTS "${schemaName}"."idx_workflow_status_attributes"`,
+      ],
+    },
+    {
+      name: '124_history_retention_state',
+      pg: [
+        `CREATE TABLE "${schemaName}".history_gc_state (
+          singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), cursor jsonb NOT NULL)`,
+        `CREATE TABLE "${schemaName}".history_gc_pending (workflow_uuid text PRIMARY KEY)`,
+        ...(isCockroach
+          ? []
+          : [
+              // Fences cover SDK starts, imports and SQL enqueue without adding a polling query.
+              // Only a status write or a child reference can race a GC page that is deciding
+              // ownership, so only those serialize on the mutation lock; every other insert
+              // belongs to a workflow whose status already exists, or is refused by a committed fence.
+              `CREATE FUNCTION "${schemaName}".history_gc_guard() RETURNS trigger AS $$
+        DECLARE target text; child text;
+        BEGIN
+          IF TG_TABLE_NAME = 'notifications' THEN target := NEW.destination_uuid;
+          ELSE target := NEW.workflow_uuid; END IF;
+          IF TG_TABLE_NAME = 'operation_outputs' THEN child := NEW.child_workflow_id; END IF;
+          IF TG_TABLE_NAME = 'workflow_status' OR child IS NOT NULL THEN
+            PERFORM pg_advisory_xact_lock_shared(${historyMutationLockKey(schemaName)}::bigint);
+          END IF;
+          IF EXISTS (SELECT 1 FROM "${schemaName}".history_gc_pending WHERE workflow_uuid=target OR workflow_uuid=child) THEN
+            RAISE EXCEPTION 'Workflow history has expired and is being collected' USING ERRCODE='55000';
+          END IF;
+          RETURN NEW;
+        END; $$ LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp`,
+              `CREATE TRIGGER history_gc_status_guard BEFORE INSERT ON "${schemaName}".workflow_status
+          FOR EACH ROW EXECUTE FUNCTION "${schemaName}".history_gc_guard()`,
+              `CREATE TRIGGER history_gc_child_guard BEFORE INSERT ON "${schemaName}".operation_outputs
+          FOR EACH ROW EXECUTE FUNCTION "${schemaName}".history_gc_guard()`,
+              `CREATE TRIGGER history_gc_resume_guard BEFORE UPDATE ON "${schemaName}".workflow_status
+                FOR EACH ROW WHEN (OLD.completed_at IS NOT NULL AND NEW.completed_at IS NULL)
+                EXECUTE FUNCTION "${schemaName}".history_gc_guard()`,
+              ...[
+                'workflow_input',
+                'workflow_output',
+                'notifications',
+                'workflow_events',
+                'workflow_events_history',
+                'streams',
+              ].map(
+                (table) => `CREATE TRIGGER history_gc_payload_guard BEFORE INSERT ON "${schemaName}".${table}
+                  FOR EACH ROW EXECUTE FUNCTION "${schemaName}".history_gc_guard()`,
+              ),
+            ]),
+      ],
+    },
+    {
+      name: '125_history_retention_indexes',
+      online: true,
+      pg: [
+        `CREATE INDEX ${isCockroach ? '' : 'CONCURRENTLY'} IF NOT EXISTS idx_workflow_status_history_gc
+          ON "${schemaName}".workflow_status(completed_at,workflow_uuid) WHERE completed_at IS NOT NULL`,
+        `CREATE INDEX ${isCockroach ? '' : 'CONCURRENTLY'} IF NOT EXISTS idx_operation_outputs_child_gc
+          ON "${schemaName}".operation_outputs(child_workflow_id,workflow_uuid) WHERE child_workflow_id IS NOT NULL`,
+      ],
     },
   ];
 }

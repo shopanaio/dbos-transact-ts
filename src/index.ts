@@ -55,3 +55,10 @@ export { VersionInfo, ApplicationRowCounts } from './system_database';
 export { EnqueueWorkflowOptions } from './enqueue_options';
 
 export { QueueControlError, type QueueControlState } from './system_database';
+
+export {
+  retainWorkflowHistory,
+  type HistoryRetentionOptions,
+  type HistoryRetentionPolicy,
+  type HistoryRetentionResult,
+} from './history_retention';
