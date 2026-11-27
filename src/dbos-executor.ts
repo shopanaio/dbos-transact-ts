@@ -96,6 +96,11 @@ export interface DBOSConfig {
   name: string;
 
   systemDatabaseUrl?: string;
+  /**
+   * Optional direct or session-pooled URL for LISTEN. It must point to the same system database
+   * as the main pool, which still runs queries and sends notifications.
+   */
+  systemDatabaseListenerUrl?: string;
   systemDatabasePoolSize?: number;
   /**
    * An optional pre-configured connection pool to use for the system database. DBOS uses this
@@ -225,6 +230,7 @@ export type DBOSConfigInternal = {
   name?: string;
 
   systemDatabaseUrl: string;
+  systemDatabaseListenerUrl?: string;
   sysDbPoolSize?: number;
   systemDatabasePollingConcurrency?: number;
   systemDatabasePool?: Pool;
@@ -308,6 +314,7 @@ export class DBOSExecutor {
       this.config.notificationCoalesceMs,
       this.appName,
       this.config.observabilityQueryTimeoutMs,
+      this.config.systemDatabaseListenerUrl,
     );
 
     new DynamicSchedulerLoop(config.schedulerPollingIntervalMs); // Create the dynamic scheduler, which registers itself.

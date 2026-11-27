@@ -172,6 +172,7 @@ export function translateDbosConfig(options: Partial<DBOSConfig>): DBOSConfigInt
   return {
     name: options.name,
     systemDatabaseUrl,
+    systemDatabaseListenerUrl: options.systemDatabaseListenerUrl,
     sysDbPoolSize: options.systemDatabasePoolSize,
     systemDatabasePollingConcurrency: options.systemDatabasePollingConcurrency,
     systemDatabasePool: options.systemDatabasePool,

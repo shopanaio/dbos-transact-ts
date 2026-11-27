@@ -1000,6 +1000,7 @@ export class SystemDatabase {
     // The application this handle acts for; undefined writes unclaimed rows.
     readonly appName?: string,
     observabilityQueryTimeoutMs: number = DEFAULT_OBSERVABILITY_QUERY_TIMEOUT_MS,
+    systemDatabaseListenerUrl?: string,
   ) {
     this.schemaName = schemaName;
     this.shouldUseDBNotifications = useListenNotify;
@@ -1035,6 +1036,15 @@ export class SystemDatabase {
       this.pool.on('error', (err: Error) => {
         this.logger.warn(`Unexpected error in pool: ${err}`);
       });
+    }
+
+    if (useListenNotify && systemDatabaseListenerUrl) {
+      this.#notificationsPool = new Pool({
+        ...getClientConfig(systemDatabaseListenerUrl),
+        application_name: `dbos_listener_${globalParams.executorID}`,
+        max: 1,
+      });
+      this.#notificationsPool.on('error', this.#onClientError);
     }
   }
 
@@ -1197,15 +1207,19 @@ export class SystemDatabase {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
     }
-    // Stop the notifier and await its final flush before the pool closes.
-    this.#notifierActive = false;
-    this.#notifierWake?.();
-    if (this.#notifierLoop) {
-      await this.#notifierLoop;
-      this.#notifierLoop = undefined;
+    if (this.#notificationsSetupClient) {
+      this.#retireNotificationsClient(this.#notificationsSetupClient);
     }
     if (this.notificationsClient) {
       this.#retireNotificationsClient(this.notificationsClient);
+    }
+    // Stop the notifier and await its final flush before the pool closes.
+    this.#notifierActive = false;
+    this.#notifierWake?.();
+    await this.#notificationsPool?.end();
+    if (this.#notifierLoop) {
+      await this.#notifierLoop;
+      this.#notifierLoop = undefined;
     }
     // A retention round still running is cut here rather than waited for: returned with an
     // error, each connection is destroyed at once, the idle lock session lets go of the
@@ -6029,11 +6043,17 @@ export class SystemDatabase {
    */
   reconnectTimeout: NodeJS.Timeout | null = null;
   #notificationsStopped: boolean = false;
+  readonly #notificationsPool?: Pool;
+  #notificationsSetupClient: PoolClient | null = null;
 
   // Disown the client and release it once; a late socket error must not re-enter this path and release again.
   #retireNotificationsClient(client: PoolClient) {
     if (this.notificationsClient === client) {
       this.notificationsClient = null;
+    } else if (this.#notificationsSetupClient === client) {
+      this.#notificationsSetupClient = null;
+    } else {
+      return;
     }
     client.removeAllListeners();
     // Cover the release() call itself, which tears the connection down and can surface a socket error.
@@ -6073,8 +6093,9 @@ export class SystemDatabase {
 
       let acquired: PoolClient | null = null;
       try {
-        const client = await this.#connect();
+        const client = await borrowClient(this.#notificationsPool ?? this.pool, this.#onClientError);
         acquired = client;
+        this.#notificationsSetupClient = client;
         if (this.#abandonIfStopped(client)) return;
 
         // Catch errors during setup
@@ -6089,20 +6110,21 @@ export class SystemDatabase {
         await client.query(`LISTEN ${DBOS_STREAMS_CHANNEL};`);
         await client.query(`LISTEN dbos_queue_control_channel;`);
 
-        // The self-test's NOTIFY needs a second client, which can queue forever on an ending pool.
+        // The self-test sends through the same pool as workflow writes.
         if (this.#abandonIfStopped(client)) return;
 
         // Self-test: verify LISTEN actually works by sending a NOTIFY and checking it arrives.
         // If a transaction-mode pooler (e.g. PgBouncer pool_mode=transaction) is in the path,
         // LISTEN succeeds but the subscription is silently lost when the backend is released.
         let selfTestReceived = false;
+        const selfTestPayload = `dbos_listen_selftest_${randomUUID()}`;
         const onSelfTest = (msg: Notification) => {
-          if (msg.channel === 'dbos_notifications_channel' && msg.payload === 'dbos_listen_selftest') {
+          if (msg.channel === DBOS_NOTIFICATIONS_CHANNEL && msg.payload === selfTestPayload) {
             selfTestReceived = true;
           }
         };
         client.on('notification', onSelfTest);
-        await this.pool.query("NOTIFY dbos_notifications_channel, 'dbos_listen_selftest'");
+        await this.pool.query('SELECT pg_notify($1, $2)', [DBOS_NOTIFICATIONS_CHANNEL, selfTestPayload]);
         for (let i = 0; i < 30 && !selfTestReceived && !setup.error && !this.#notificationsStopped; i++) {
           await new Promise((r) => setTimeout(r, 100));
         }
@@ -6149,12 +6171,14 @@ export class SystemDatabase {
           this.#retireNotificationsClient(client);
           reconnect();
         });
+        this.#notificationsSetupClient = null;
         this.notificationsClient = client;
       } catch (error) {
-        this.logger.warn(`Error in notifications listener: ${String(error)}`);
         if (acquired) {
           this.#retireNotificationsClient(acquired);
         }
+        if (this.#notificationsStopped) return;
+        this.logger.warn(`Error in notifications listener: ${String(error)}`);
         reconnect();
       }
     };

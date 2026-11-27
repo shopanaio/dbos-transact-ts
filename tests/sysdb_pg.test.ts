@@ -613,6 +613,45 @@ describe('sysdb-notifications-lifecycle', () => {
     expect(systemDatabase.reconnectTimeout).toBeNull();
   });
 
+  test('receives notifications on a dedicated session with a single query-pool connection', async () => {
+    const pool = new Pool({ connectionString: config.systemDatabaseUrl, max: 1, connectionTimeoutMillis: 1000 });
+    try {
+      DBOS.setConfig({
+        ...config,
+        systemDatabasePool: pool,
+        systemDatabaseListenerUrl: config.systemDatabaseUrl,
+      });
+      await DBOS.launch();
+      const systemDatabase = sysDB();
+      const listener = systemDatabase.notificationsClient;
+      expect(listener).not.toBeNull();
+      const listenerBackend = await listener!.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      const queryBackend = await pool.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      expect(queryBackend.rows[0].pid).not.toBe(listenerBackend.rows[0].pid);
+
+      const payload = randomUUID();
+      const callback = jest.fn();
+      const registration = systemDatabase.notificationsMap.registerCallback(payload, callback);
+      try {
+        await pool.query('SELECT pg_notify($1, $2)', ['dbos_notifications_channel', payload]);
+        for (let i = 0; i < 50 && !callback.mock.calls.length; i++) {
+          await sleepms(20);
+        }
+        expect(callback).toHaveBeenCalledTimes(1);
+      } finally {
+        systemDatabase.notificationsMap.deregisterCallback(registration);
+      }
+
+      await DBOS.shutdown();
+      expect(systemDatabase.notificationsClient).toBeNull();
+      expect((await pool.query('SELECT 1')).rowCount).toBe(1);
+    } finally {
+      await DBOS.shutdown();
+      DBOS.setConfig(config);
+      await pool.end();
+    }
+  });
+
   test('reconnects-after-error-but-not-after-shutdown', async () => {
     await DBOS.launch();
     const systemDatabase = sysDB();
